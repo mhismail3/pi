@@ -83,6 +83,33 @@ Keep personal servers and servers with credentials in the user-level file. Use t
 
 `pi mcp add` and `pi mcp remove` cover common changes from a shell. See [MCP commands](cli.md#mcp-commands) for their options.
 
+### Credential references
+
+`env` and `headers` also accept validated credential references instead of strings:
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": { "source": "1password", "reference": "op://vault/item/field", "format": "bearer" }
+      }
+    },
+    "local": {
+      "command": "tools-server",
+      "env": { "TOKEN": { "source": "keychain", "service": "tools", "account": "default" } }
+    }
+  }
+}
+```
+
+The optional `format` accepts only `bearer`, adding the fixed `Bearer ` prefix. References have no executable, interpolation, shell, or arbitrary prefix fields. Locators must be `op://vault/item/field` or `op://vault/item/section/field`; fields are nonempty, at most 2048 characters, and cannot contain control characters. Keychain service and account have the same string bounds. Unknown fields are rejected. These references authorize reading a credential and sending it to the configured server; project trust is not a sandbox. Keep them in the user-level file unless the project and destination are trusted.
+
+Validation and configuration loading do not resolve references. Connection setup runs `op read --no-newline <reference>` or, on macOS, `/usr/bin/security find-generic-password -s <service> -a <account> -w` with direct arguments. Pi finds `op` only at `/opt/homebrew/bin/op` or `/usr/local/bin/op` on macOS, and `/usr/local/bin/op` or `/usr/bin/op` elsewhere, never through project `PATH` or a server's `env`. An SDK host can select an absolute `opExecutable` through `resolveConfigValueAsync`; that option is trusted host configuration, not an `mcp.json` field.
+
+Each process has a 10-second deadline and a 64-KiB stdout limit. Stderr is discarded. Empty, multiline, NUL-containing or failed output is refused with a fixed diagnostic; references and subprocess output are not included in errors. Shutdown cancels resolution and joins the actual child before returning. Reference results are not cached or persisted by the resolver. Existing string and `!command` resolution is unchanged, including its existing shell behavior.
+
 ### Inspect or change a server
 
 `/mcp` lists configured servers with their state, tool count, exposure, and configuration source. Servers that need attention appear first. Select a server to inspect its tools and connection details, reconnect, sign in or out, change exposure, or enable and disable it.

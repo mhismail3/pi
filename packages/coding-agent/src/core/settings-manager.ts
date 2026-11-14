@@ -1,8 +1,23 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ScrollViewScrollbar, TerminalCapabilities, WheelScrollLines } from "@earendil-works/pi-tui";
-import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { createHash, randomUUID } from "crypto";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fchmodSync,
+	fstatSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
@@ -25,6 +40,7 @@ import type {
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+import { SettingsSchema } from "./settings-schema.ts";
 
 export type {
 	BranchSummarySettings,
@@ -173,6 +189,16 @@ export interface SettingsError {
 	error: Error;
 }
 
+export type UnsetGlobalSettingsReceipt =
+	| { status: "unchanged"; changedKeys: [] }
+	| {
+			status: "applied";
+			changedKeys: (keyof Settings)[];
+			backupPath: string;
+			beforeSha256: string;
+			afterSha256: string;
+	  };
+
 type SettingsPaths = Partial<Record<SettingsScope, string>>;
 
 function toSettingsError(scope: SettingsScope, error: unknown, path?: string): SettingsError {
@@ -219,6 +245,114 @@ export class FileSettingsStorage implements SettingsStorage {
 		}
 
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
+	}
+
+	unsetGlobalSettings(keys: readonly (keyof Settings)[]): { receipt: UnsetGlobalSettingsReceipt; settings: Settings } {
+		const path = this.globalSettingsPath;
+		const initial = lstatSync(path, { throwIfNoEntry: false });
+		if (!initial) return { receipt: { status: "unchanged", changedKeys: [] }, settings: {} };
+		if (!initial.isFile() || initial.nlink !== 1) throw new Error("Unsafe settings file");
+		const release = this.acquireLockSyncWithRetry(path);
+		try {
+			if (!existsSync(path)) {
+				return { receipt: { status: "unchanged", changedKeys: [] }, settings: {} };
+			}
+			const directory = dirname(path);
+			const realDirectory = realpathSync(directory);
+			const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+			let original: Buffer;
+			let identity: ReturnType<typeof fstatSync>;
+			try {
+				identity = fstatSync(fd);
+				if (!identity.isFile() || identity.nlink !== 1) throw new Error("Unsafe settings file");
+				original = readFileSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(stripBom(original.toString("utf8")));
+			} catch {
+				throw new Error("Invalid settings file");
+			}
+			if (!isMergeableObject(parsed)) throw new Error("Invalid settings file");
+			const changedKeys = keys.filter((key) => Object.hasOwn(parsed, key));
+			if (changedKeys.length === 0) {
+				return { receipt: { status: "unchanged", changedKeys: [] }, settings: parsed as Settings };
+			}
+			for (const key of changedKeys) delete parsed[key];
+			const next = Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`);
+			const backupPath = `${path}.backup-${randomUUID()}`;
+			const temporary = `${path}.unset-${randomUUID()}`;
+			const directoryFd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+			let renamed = false;
+			try {
+				const directoryIdentity = fstatSync(directoryFd);
+				const backupFd = openSync(backupPath, "wx", 0o600);
+				try {
+					fchmodSync(backupFd, 0o600);
+					writeFileSync(backupFd, original);
+					fsyncSync(backupFd);
+				} finally {
+					closeSync(backupFd);
+				}
+				fsyncSync(directoryFd);
+				const temporaryFd = openSync(temporary, "wx", 0o600);
+				try {
+					fchmodSync(temporaryFd, 0o600);
+					writeFileSync(temporaryFd, next);
+					fsyncSync(temporaryFd);
+				} finally {
+					closeSync(temporaryFd);
+				}
+				const currentDirectory = lstatSync(directory);
+				if (
+					realpathSync(directory) !== realDirectory ||
+					currentDirectory.dev !== directoryIdentity.dev ||
+					currentDirectory.ino !== directoryIdentity.ino ||
+					!currentDirectory.isDirectory()
+				) {
+					throw new Error("Settings directory changed during unset");
+				}
+				const currentFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+				try {
+					const current = fstatSync(currentFd);
+					if (
+						!current.isFile() ||
+						current.nlink !== 1 ||
+						current.dev !== identity.dev ||
+						current.ino !== identity.ino ||
+						current.size !== identity.size ||
+						current.mtimeMs !== identity.mtimeMs ||
+						!readFileSync(currentFd).equals(original)
+					) {
+						throw new Error("Settings changed during unset");
+					}
+				} finally {
+					closeSync(currentFd);
+				}
+				renameSync(temporary, path);
+				renamed = true;
+				fsyncSync(directoryFd);
+			} catch {
+				throw new Error(renamed ? "Settings unset durability uncertain" : "Settings unset refused before commit");
+			} finally {
+				closeSync(directoryFd);
+				if (existsSync(temporary)) unlinkSync(temporary);
+			}
+			return {
+				receipt: {
+					status: "applied",
+					changedKeys,
+					backupPath,
+					beforeSha256: createHash("sha256").update(original).digest("hex"),
+					afterSha256: createHash("sha256").update(next).digest("hex"),
+				},
+				settings: parsed as Settings,
+			};
+		} finally {
+			release();
+		}
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
@@ -275,6 +409,7 @@ export class SettingsManager {
 	private projectSettings: Settings;
 	private settings: Settings;
 	private projectTrusted: boolean;
+	private fieldRevisions = new Map<keyof Settings, number>();
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
@@ -533,6 +668,7 @@ export class SettingsManager {
 	/** Mark a global field as modified during this session */
 	private markModified(field: keyof Settings, nestedKey?: string): void {
 		this.modifiedFields.add(field);
+		this.fieldRevisions.set(field, (this.fieldRevisions.get(field) ?? 0) + 1);
 		if (nestedKey) {
 			if (!this.modifiedNestedFields.has(field)) {
 				this.modifiedNestedFields.set(field, new Set());
@@ -580,7 +716,7 @@ export class SettingsManager {
 					this.assertProjectTrustedForWrite();
 				}
 				task();
-				this.clearModifiedScope(scope);
+				if (scope === "project") this.clearModifiedScope(scope);
 			})
 			.catch((error) => {
 				this.recordError(scope, error);
@@ -636,6 +772,7 @@ export class SettingsManager {
 		const snapshotGlobalSettings = structuredClone(this.globalSettings);
 		const modifiedFields = new Set(this.modifiedFields);
 		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedNestedFields);
+		this.clearModifiedScope("global");
 
 		this.enqueueWrite("global", () => {
 			this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
@@ -665,6 +802,37 @@ export class SettingsManager {
 		update(projectSettings);
 		this.markProjectModified(field);
 		this.saveProjectSettings(projectSettings);
+	}
+
+	unsetGlobalSettings(keys: readonly (keyof Settings)[]): Promise<UnsetGlobalSettingsReceipt> {
+		const requested = [...new Set(keys)];
+		if (requested.some((key) => !Object.hasOwn(SettingsSchema.properties, key))) {
+			return Promise.reject(new Error("Unknown settings key"));
+		}
+		const storage = this.storage;
+		if (!(storage instanceof FileSettingsStorage))
+			return Promise.reject(new Error("Unset requires file settings storage"));
+		const revisions = new Map(this.fieldRevisions);
+		const operation = this.writeQueue.then(() => {
+			if (this.globalSettingsLoadError) throw new Error("Global settings could not be loaded");
+			const { receipt, settings } = storage.unsetGlobalSettings(requested);
+			const updated = SettingsManager.migrateSettings(settings as Record<string, unknown>);
+			for (const [field, revision] of this.fieldRevisions) {
+				if (revision !== revisions.get(field)) {
+					(updated as Record<string, unknown>)[field] = this.globalSettings[field];
+				}
+			}
+			this.globalSettings = updated;
+			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+			return receipt;
+		});
+		this.writeQueue = operation.then(
+			() => undefined,
+			(error) => {
+				this.recordError("global", error);
+			},
+		);
+		return operation;
 	}
 
 	async flush(): Promise<void> {
