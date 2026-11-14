@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import {
 	chmodSync,
 	existsSync,
@@ -9,6 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +25,7 @@ import {
 	McpSessionExpiredError,
 } from "@earendil-works/pi-mcp";
 import { createInMemoryTransportPair, type InMemoryTransport } from "@earendil-works/pi-mcp/testing";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAuthStorageBackend } from "../src/core/auth-storage.ts";
 import {
 	addMcpServerConfig,
@@ -48,6 +50,8 @@ const TOKEN_HEADER = "Bearer ${TOKEN}";
 describe("MCP config", () => {
 	const dirs: string[] = [];
 	afterEach(() => {
+		vi.restoreAllMocks();
+		syncBuiltinESMExports();
 		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 
@@ -206,7 +210,20 @@ describe("MCP config", () => {
 			},
 			{},
 		);
+		const marker = join(paths.agentDir, "resolution-attempt");
+		const refuseExecution = () => {
+			writeFileSync(marker, "attempted");
+			throw new Error("Inventory must not execute");
+		};
+		const spawn = vi.spyOn(childProcess, "spawn").mockImplementation(refuseExecution);
+		const spawnSync = vi.spyOn(childProcess, "spawnSync").mockImplementation(refuseExecution);
+		const execSync = vi.spyOn(childProcess, "execSync").mockImplementation(refuseExecution);
+		syncBuiltinESMExports();
 		const { servers, errors } = loadMcpConfig({ ...paths, projectTrusted: false });
+		expect(spawn).not.toHaveBeenCalled();
+		expect(spawnSync).not.toHaveBeenCalled();
+		expect(execSync).not.toHaveBeenCalled();
+		expect(existsSync(marker)).toBe(false);
 		expect(servers.map((entry) => entry.config)).toEqual([
 			{ url: "https://example.com/mcp", headers: { Authorization: reference }, enabled: false },
 			{ command: "unused", env: { TOKEN: keychain }, enabled: false },
@@ -639,6 +656,154 @@ for await (const line of createInterface({ input: process.stdin })) {
 				expect(connection.error).toBe("Credential resolution failed");
 			} finally {
 				await connection.close();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"delivers fixture bearer headers through the default HTTP transport",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-mcp-reference-http-"));
+			const executable = join(root, "op.cjs");
+			const authorizations: (string | undefined)[] = [];
+			writeFileSync(executable, `#!${process.execPath}\nprocess.stdout.write('fixture-token');\n`);
+			chmodSync(executable, 0o700);
+			const server = createServer(async (request, response) => {
+				authorizations.push(request.headers.authorization);
+				const chunks: Buffer[] = [];
+				for await (const chunk of request) chunks.push(Buffer.from(chunk));
+				const body = Buffer.concat(chunks).toString("utf8");
+				const message = body ? JSON.parse(body) : undefined;
+				if (message?.method === "notifications/initialized") {
+					response.writeHead(202).end();
+					return;
+				}
+				const result =
+					message?.method === "initialize"
+						? {
+								protocolVersion: LATEST_PROTOCOL_VERSION,
+								capabilities: { tools: {} },
+								serverInfo: { name: "fixture", version: "1" },
+							}
+						: { tools: [] };
+				response.writeHead(200, { "content-type": "application/json" });
+				response.end(message ? JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) : "");
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			const { port } = server.address() as AddressInfo;
+			const connection = new McpServerConnection({
+				entry: {
+					name: "fixture",
+					source: "test",
+					config: {
+						url: `http://127.0.0.1:${port}/mcp`,
+						headers: { Authorization: { source: "1password", reference: "op://v/i/f", format: "bearer" } },
+					},
+				},
+				cwd: root,
+				createTransport: (entry, cwd, auth, signal) =>
+					createDefaultTransport(entry, cwd, auth, signal, { opExecutable: executable }),
+				credentials: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()),
+				onTools: () => {},
+			});
+			try {
+				await connection.getClient();
+				expect(connection.state).toBe("connected");
+				expect(authorizations.length).toBeGreaterThan(0);
+				expect(authorizations.every((value) => value === "Bearer fixture-token")).toBe(true);
+			} finally {
+				await connection.close();
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"preserves reference output in a real stdio server environment without HTTP constraints",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-mcp-reference-env-"));
+			const executable = join(root, "op.cjs");
+			const output = " \tfixture-雪\x01\x7f \t";
+			writeFileSync(executable, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(output)});\n`);
+			chmodSync(executable, 0o700);
+			const serverPath = join(root, "server.mjs");
+			writeFileSync(
+				serverPath,
+				`import { createInterface } from 'node:readline';\nfor await (const line of createInterface({ input: process.stdin })) {\nconst message = JSON.parse(line); if (!("id" in message)) continue;\nconst result = message.method === 'initialize' ? { protocolVersion: ${JSON.stringify(LATEST_PROTOCOL_VERSION)}, capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } } : message.method === 'tools/list' ? { tools: [{ name: 'env', inputSchema: { type: 'object' } }] } : { content: [{ type: 'text', text: process.env.TOKEN }] };\nprocess.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n');\n}\n`,
+			);
+			const connection = new McpServerConnection({
+				entry: {
+					name: "fixture",
+					source: "test",
+					config: {
+						command: process.execPath,
+						args: [serverPath],
+						env: { TOKEN: { source: "1password", reference: "op://v/i/f" }, PATH: "untrusted-server-path" },
+					},
+				},
+				cwd: root,
+				createTransport: (entry, cwd, auth, signal) =>
+					createDefaultTransport(entry, cwd, auth, signal, { opExecutable: executable }),
+				credentials: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()),
+				onTools: () => {},
+			});
+			try {
+				expect(await connection.callTool("env", {}, {})).toEqual({ content: [{ type: "text", text: output }] });
+			} finally {
+				await connection.close();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"refuses unrepresentable reference headers before transport errors can quote or normalize them",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-mcp-reference-header-errors-"));
+			const executable = join(root, "op.cjs");
+			try {
+				for (const [key, output] of [
+					["Authorization", "private-http\x7f"],
+					["Authorization", "private-http\x01"],
+					["Authorization", "private-http雪"],
+					["Authorization", " private-http"],
+					["Authorization", "private-http\t"],
+					["invalid name", "private-http"],
+				]) {
+					writeFileSync(executable, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(output)});\n`);
+					chmodSync(executable, 0o700);
+					const errorSink: string[] = [];
+					const connection = new McpServerConnection({
+						entry: {
+							name: "fixture",
+							source: "test",
+							config: {
+								url: "https://unused.invalid",
+								headers: { [key]: { source: "1password", reference: "op://v/i/f" } },
+							},
+						},
+						cwd: root,
+						createTransport: (entry, cwd, auth, signal) =>
+							createDefaultTransport(entry, cwd, auth, signal, { opExecutable: executable }),
+						credentials: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()),
+						onTools: () => {},
+						onChange: (current) => {
+							if (current.error) errorSink.push(current.error);
+						},
+					});
+					try {
+						await expect(connection.getClient()).rejects.toThrow(
+							/^MCP server "fixture" failed to connect: Invalid credential reference HTTP header$/,
+						);
+						expect(connection.error).toBe("Invalid credential reference HTTP header");
+						expect(errorSink).toEqual(["Invalid credential reference HTTP header"]);
+					} finally {
+						await connection.close();
+					}
+				}
+			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
 		},
