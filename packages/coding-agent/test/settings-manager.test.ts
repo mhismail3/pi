@@ -621,6 +621,36 @@ describe("SettingsManager", () => {
 	});
 
 	describe("reload", () => {
+		it.each([false, true])(
+			"preserves global setters accepted after reload starts (load recovery: %s)",
+			async (recovering) => {
+				const settingsPath = join(agentDir, "settings.json");
+				writeFileSync(settingsPath, JSON.stringify({ theme: "old" }));
+				const manager = SettingsManager.create(projectDir, agentDir);
+				if (recovering) {
+					writeFileSync(settingsPath, "{ invalid json");
+					await manager.reload();
+					expect(manager.drainErrors()).toMatchObject([{ scope: "global", path: settingsPath }]);
+					writeFileSync(settingsPath, JSON.stringify({ theme: "old" }));
+				}
+
+				const loading = manager.reload();
+				manager.setTheme("new");
+				await loading;
+				await manager.flush();
+
+				const expected = { theme: "new" };
+				expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(expected);
+				expect(manager.getTheme()).toBe("new");
+				expect(manager.getGlobalSettings()).toEqual(expected);
+				const fresh = SettingsManager.create(projectDir, agentDir);
+				expect(fresh.getGlobalSettings()).toEqual(expected);
+				expect(fresh.getSettings()).toEqual(manager.getSettings());
+				expect(manager.drainErrors()).toEqual([]);
+				expect(fresh.drainErrors()).toEqual([]);
+			},
+		);
+
 		it("should reload global settings from disk", async () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(
