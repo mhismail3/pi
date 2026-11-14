@@ -13,6 +13,7 @@ import {
 	type McpStdioServerConfig as McpStdioServerFields,
 	validateMcpServerConfig as validateMcpServerFields,
 } from "@earendil-works/pi-mcp";
+import { type ConfigValue, isCredentialReference } from "./resolve-config-value.ts";
 
 /**
  * Regular expression for a tool name pattern where `*` matches any characters, as `toolExposure`,
@@ -88,10 +89,10 @@ interface McpServerConfigBase {
 	timeout?: number;
 }
 
-export interface McpStdioServerConfig extends McpStdioServerFields, McpServerConfigBase {
+export interface McpStdioServerConfig extends Omit<McpStdioServerFields, "env">, McpServerConfigBase {
 	// Shared fields, declared again for pi's documentation.
 	/** Values may reference environment variables (`${NAME}`) or commands (`!cmd`). */
-	env?: Record<string, string>;
+	env?: Record<string, ConfigValue>;
 	/** Relative paths resolve against the session working directory. */
 	cwd?: string;
 }
@@ -126,10 +127,10 @@ export function isClientMetadataDocumentCallback(callbackUrl: string | undefined
 	return url.hostname !== "[::1]" && url.pathname === "/callback";
 }
 
-export interface McpHttpServerConfig extends McpHttpServerFields, McpServerConfigBase {
+export interface McpHttpServerConfig extends Omit<McpHttpServerFields, "headers">, McpServerConfigBase {
 	// `headers` is shared, declared again for pi's documentation; `oauth` narrows to pi's documented type.
 	/** Values may reference environment variables (`${NAME}`) or commands (`!cmd`). */
-	headers?: Record<string, string>;
+	headers?: Record<string, ConfigValue>;
 	oauth?: McpOAuthConfig;
 	/**
 	 * Send the token of a pi provider (`/login <provider>`) instead of using OAuth. Not allowed in project
@@ -211,7 +212,27 @@ function checkAuth(auth: unknown, url: string): string | undefined {
  * copy of the config with exposure aliases resolved, or an error message.
  */
 export function validateMcpServerConfig(name: string, raw: unknown): McpServerConfig | string {
-	const result = validateMcpServerFields(name, isRecord(raw) ? resolveExposureAliases(raw) : raw, {
+	const entry = isRecord(raw) ? resolveExposureAliases(raw) : raw;
+	const values: Record<string, unknown> = {};
+	if (isRecord(entry)) {
+		const http =
+			typeof entry.url === "string" &&
+			(entry.type === undefined || entry.type === "http" || entry.type === "streamable-http");
+		const field = http ? "headers" : "env";
+		const record = entry[field];
+		if (isRecord(record)) {
+			const strings: Record<string, string> = {};
+			for (const [key, value] of Object.entries(record)) {
+				if (typeof value !== "string" && !isCredentialReference(value)) {
+					return `server "${name}": ${field} must map names to strings or credential references`;
+				}
+				strings[key] = typeof value === "string" ? value : "";
+			}
+			values[field] = record;
+			entry[field] = strings;
+		}
+	}
+	const result = validateMcpServerFields(name, entry, {
 		checkMetadataDocumentCallback: (callbackUrl) =>
 			isClientMetadataDocumentCallback(callbackUrl)
 				? undefined
@@ -223,7 +244,7 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 		(result.kind === "http" ? checkAuth(result.config.auth, result.config.url) : undefined);
 	if (error) return `server "${name}": ${error}`;
 	// The cast holds because pi's fields were checked above, which the types cannot express.
-	return result.config as McpServerConfig;
+	return { ...result.config, ...values } as McpServerConfig;
 }
 
 /** A server an extension registered with `pi.registerMcpServer()`. */

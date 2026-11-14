@@ -1,10 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
 	clearConfigValueCache,
+	isCredentialReference,
 	resolveConfigValue,
+	resolveConfigValueAsync,
 	resolveConfigValueUncached,
 } from "../src/core/resolve-config-value.ts";
 import * as shellModule from "../src/utils/shell.ts";
@@ -101,6 +103,71 @@ describe("resolveConfigValue", () => {
 		expect(resolveConfigValueUncached(command)).toBe("value");
 		expect(readFileSync(counterFile, "utf-8").trim()).toBe("2");
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"keeps reference arguments inert and scrubs resolver failures",
+		async () => {
+			const executable = join(tempDir, "op");
+			const recorded = join(tempDir, "argv.json");
+			writeFileSync(
+				executable,
+				`#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)));\nprocess.stderr.write('private-child-diagnostic');\nprocess.exit(9);\n`,
+			);
+			chmodSync(executable, 0o700);
+			const reference = "op://vault/item/field ; printf not-executed | $(echo unsafe) 'quoted'";
+			expect(isCredentialReference({ source: "1password", reference })).toBe(true);
+			await expect(
+				resolveConfigValueAsync({ source: "1password", reference }, { opExecutable: executable }),
+			).rejects.toThrow(/^Credential resolution failed$/);
+			expect(JSON.parse(readFileSync(recorded, "utf8"))).toEqual(["read", "--no-newline", reference]);
+			for (const invalid of [
+				{ source: "1password", reference: "op://v/i/f\n" },
+				{ source: "1password", reference: "!echo bad" },
+				{ source: "1password", reference: "op://v/i/f", executable: "/bin/sh" },
+				{ source: "keychain", service: "s", account: "a", format: "prefix" },
+				{ source: "keychain", service: "s", account: "a\0" },
+			])
+				expect(isCredentialReference(invalid)).toBe(false);
+			rmSync(recorded);
+			await expect(
+				resolveConfigValueAsync({ source: "1password", reference: "invalid" }, { opExecutable: executable }),
+			).rejects.toThrow("Invalid credential reference");
+			expect(existsSync(recorded)).toBe(false);
+			await expect(
+				resolveConfigValueAsync(
+					{ source: "1password", reference: "op://v/i/f" },
+					{ opExecutable: join(tempDir, "missing") },
+				),
+			).rejects.toThrow(/^Credential resolver unavailable$/);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"bounds output and joins the actual child on overflow and timeout",
+		async () => {
+			const executable = join(tempDir, "op");
+			const pidFile = join(tempDir, "pid");
+			writeFileSync(
+				executable,
+				`#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nif (process.argv.at(-1).endsWith('/overflow')) process.stdout.write('x'.repeat(65537));\nsetInterval(() => {}, 1000);\n`,
+			);
+			chmodSync(executable, 0o700);
+			for (const mode of ["overflow", "timeout"]) {
+				await expect(
+					resolveConfigValueAsync(
+						{ source: "1password", reference: `op://v/i/${mode}` },
+						{ opExecutable: executable },
+					),
+				).rejects.toThrow(
+					mode === "overflow" ? "Credential output exceeded limit" : "Credential resolution timed out",
+				);
+				const pid = Number(readFileSync(pidFile, "utf8"));
+				expect(() => process.kill(pid, 0)).toThrow();
+				rmSync(pidFile);
+			}
+		},
+		15_000,
+	);
 
 	test("uses stdin when the configured Windows shell requires it", () => {
 		if (process.platform === "win32") return;

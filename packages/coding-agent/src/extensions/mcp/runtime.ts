@@ -35,7 +35,11 @@ import {
 	type OAuthChallenge,
 } from "@earendil-works/pi-mcp/oauth";
 import { VERSION } from "../../config.ts";
-import { resolveConfigValueOrThrow, resolveHeadersOrThrow } from "../../core/resolve-config-value.ts";
+import {
+	type CredentialReferenceOptions,
+	resolveConfigValueAsync,
+	resolveConfigValueOrThrow,
+} from "../../core/resolve-config-value.ts";
 import { sliceTail } from "../../core/tools/truncate.ts";
 import type { McpServerEntry } from "./config.ts";
 import type { McpServerLog } from "./log.ts";
@@ -62,7 +66,8 @@ export type McpTransportFactory = (
 	entry: McpServerEntry,
 	cwd: string,
 	authProvider: AuthProvider | undefined,
-) => McpTransport;
+	signal?: AbortSignal,
+) => McpTransport | Promise<McpTransport>;
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -97,22 +102,29 @@ function expandHome(value: string): string {
 	return value;
 }
 
-export function createDefaultTransport(
+export async function createDefaultTransport(
 	entry: McpServerEntry,
 	cwd: string,
 	authProvider: AuthProvider | undefined,
-): McpTransport {
+	signal?: AbortSignal,
+	options: Omit<CredentialReferenceOptions, "signal"> = {},
+): Promise<McpTransport> {
 	const { config, name } = entry;
+	const resolveOptions = { ...options, signal };
 	if ("url" in config) {
+		const headers: Record<string, string> = {};
+		for (const [key, value] of Object.entries(config.headers ?? {})) {
+			headers[key] = await resolveConfigValueAsync(value, resolveOptions, `MCP server "${name}" header "${key}"`);
+		}
 		return new StreamableHttpTransport({
 			url: config.url,
-			headers: resolveHeadersOrThrow(config.headers, `MCP server "${name}"`),
+			headers,
 			authProvider,
 		});
 	}
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(config.env ?? {})) {
-		env[key] = resolveConfigValueOrThrow(value, `MCP server "${name}" env "${key}"`);
+		env[key] = await resolveConfigValueAsync(value, resolveOptions, `MCP server "${name}" env "${key}"`);
 	}
 	return new StdioTransport({
 		command: expandHome(config.command),
@@ -377,7 +389,11 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.shutdown.signal.addEventListener("abort", closeClient, { once: true });
 		let transport: McpTransport | undefined;
 		try {
-			transport = this.createTransport(this.entry, this.cwd, this.authProvider);
+			transport = await this.createTransport(this.entry, this.cwd, this.authProvider, this.shutdown.signal);
+			if (this.closed) {
+				await transport.close();
+				throw new Error("shut down while resolving configuration");
+			}
 			await client.connect(transport);
 			client.onNotification("notifications/tools/list_changed", () => {
 				void this.refreshTools(client);
