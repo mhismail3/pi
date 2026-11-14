@@ -150,23 +150,24 @@ describe("resolveConfigValue", () => {
 		async () => {
 			const executable = join(tempDir, "op.cjs");
 			const recorded = join(tempDir, "argv.json");
-			const output = " \t\uFEFFfixture-雪\t ";
-			writeFileSync(
-				executable,
-				`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write(Buffer.from(${JSON.stringify(Buffer.from(output).toString("base64"))}, 'base64'));\n`,
-			);
-			chmodSync(executable, 0o700);
-			const reference = "op://vault/item/field ; $() | 'quoted'";
-			expect(await resolveConfigValueAsync({ source: "1password", reference }, { opExecutable: executable })).toBe(
-				output,
-			);
-			expect(JSON.parse(readFileSync(recorded, "utf8"))).toEqual(["read", "--no-newline", reference]);
-			expect(
-				await resolveConfigValueAsync(
-					{ source: "1password", reference, format: "bearer" },
-					{ opExecutable: executable },
-				),
-			).toBe(`Bearer ${output}`);
+			for (const output of ["\uFEFF \tfixture-雪\t ", " \t "]) {
+				writeFileSync(
+					executable,
+					`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write(Buffer.from(${JSON.stringify(Buffer.from(output).toString("base64"))}, 'base64'));\n`,
+				);
+				chmodSync(executable, 0o700);
+				const reference = "op://vault/item/field ; $() | 'quoted'";
+				expect(
+					await resolveConfigValueAsync({ source: "1password", reference }, { opExecutable: executable }),
+				).toBe(output);
+				expect(JSON.parse(readFileSync(recorded, "utf8"))).toEqual(["read", "--no-newline", reference]);
+				expect(
+					await resolveConfigValueAsync(
+						{ source: "1password", reference, format: "bearer" },
+						{ opExecutable: executable },
+					),
+				).toBe(`Bearer ${output}`);
+			}
 		},
 	);
 
