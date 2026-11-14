@@ -214,7 +214,7 @@ describe("SettingsManager", () => {
 					images: { autoResize: true, blockImages: true },
 					retry: { enabled: true, maxRetries: 9 },
 					markdown: { mermaid: "off", codeBlockIndent: "old" },
-					modelThinkingLevels: { "old/model": "low" },
+					modelThinkingLevels: { "old/model": "low", "stale/model": "medium" },
 					extensionChangelogVersions: { old: "1" },
 				}),
 			);
