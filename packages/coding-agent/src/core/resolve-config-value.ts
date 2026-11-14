@@ -96,10 +96,19 @@ export async function resolveConfigValueAsync(
 		child.once("close", (code) => {
 			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", abort);
-			const output = failure ? "" : Buffer.concat(chunks).toString("utf8").trim();
-			if (failure || code !== 0 || !output || /[\x00\r\n]/.test(output)) {
+			if (failure || code !== 0) {
 				reject(new Error(failure ?? "Credential resolution failed"));
-			} else resolve(output);
+				return;
+			}
+			let bytes = Buffer.concat(chunks);
+			if (config.source === "keychain" && bytes.at(-1) === 0x0a) bytes = bytes.subarray(0, -1);
+			try {
+				const output = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+				if (!output || /[\x00\r\n]/.test(output)) throw new Error();
+				resolve(output);
+			} catch {
+				reject(new Error("Credential resolution failed"));
+			}
 		});
 		if (options.signal?.aborted) abort();
 	});

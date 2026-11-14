@@ -330,6 +330,8 @@ export {
 	type RetrySettings,
 	SettingsManager,
 	type SettingsManagerCreateOptions,
+	SettingsUnsetError,
+	type SettingsUnsetRecovery,
 	type TuiMode,
 	type UnsetGlobalSettingsReceipt,
 } from "./core/settings-manager.ts";
