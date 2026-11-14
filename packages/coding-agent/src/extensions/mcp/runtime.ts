@@ -114,7 +114,21 @@ export async function createDefaultTransport(
 	if ("url" in config) {
 		const headers: Record<string, string> = {};
 		for (const [key, value] of Object.entries(config.headers ?? {})) {
-			headers[key] = await resolveConfigValueAsync(value, resolveOptions, `MCP server "${name}" header "${key}"`);
+			const resolved = await resolveConfigValueAsync(value, resolveOptions, `MCP server "${name}" header "${key}"`);
+			if (typeof value !== "string") {
+				try {
+					if (
+						/[^\x09\x20-\x7e]/.test(resolved) ||
+						new Headers([[key, resolved]]).get(key) !== resolved ||
+						Object.keys(config.headers ?? {}).filter((header) => header.toLowerCase() === key.toLowerCase())
+							.length !== 1
+					)
+						throw new Error();
+				} catch {
+					throw new Error("Invalid credential reference HTTP header");
+				}
+			}
+			headers[key] = resolved;
 		}
 		return new StreamableHttpTransport({
 			url: config.url,
