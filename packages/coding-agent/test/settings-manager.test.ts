@@ -1,4 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { createHash } from "crypto";
+import {
+	chmodSync,
+	existsSync,
+	linkSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -108,6 +120,84 @@ describe("SettingsManager", () => {
 			// In-memory change should win
 			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
 			expect(savedSettings.defaultThinkingLevel).toBe("high");
+		});
+	});
+
+	describe("backup-first global unset", () => {
+		it("backs up exact bytes and serializes deletion between setters without resurrecting keys", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const original = Buffer.from('\uFEFF{ "theme": "dark", "hideThinkingBlock": true, "custom": {"keep": 1} }\n');
+			writeFileSync(settingsPath, original);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const unset = manager.unsetGlobalSettings(["theme", "hideThinkingBlock"]);
+			manager.setDefaultThinkingLevel("high");
+			const receipt = await unset;
+			await manager.flush();
+			expect(receipt.status).toBe("applied");
+			if (receipt.status !== "applied") throw new Error("Expected applied receipt");
+			expect(readFileSync(receipt.backupPath)).toEqual(original);
+			expect(statSync(receipt.backupPath).mode & 0o777).toBe(0o600);
+			expect(receipt.beforeSha256).toBe(createHash("sha256").update(original).digest("hex"));
+			expect(receipt.changedKeys).toEqual(["theme", "hideThinkingBlock"]);
+			expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual({
+				custom: { keep: 1 },
+				defaultThinkingLevel: "high",
+			});
+			expect(manager.getTheme()).toBeUndefined();
+			expect(manager.getHideThinkingBlock()).toBe(false);
+			expect(SettingsManager.create(projectDir, agentDir).getGlobalSettings()).toEqual(manager.getGlobalSettings());
+			expect(await manager.unsetGlobalSettings(["theme"])).toEqual({ status: "unchanged", changedKeys: [] });
+			expect(readdirSync(agentDir).filter((name) => name.includes(".backup-"))).toHaveLength(1);
+		});
+
+		it("preserves prior queued writes, external fields, later same-key setters and project overrides", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark", hideThinkingBlock: true }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ theme: "project" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark", hideThinkingBlock: true, external: 7 }));
+			manager.setDefaultThinkingLevel("low");
+			const unset = manager.unsetGlobalSettings(["theme", "hideThinkingBlock"]);
+			manager.setTheme("dark");
+			const receipt = await unset;
+			await manager.flush();
+			expect(receipt.status).toBe("applied");
+			expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual({
+				theme: "dark",
+				defaultThinkingLevel: "low",
+				external: 7,
+			});
+			expect(manager.getGlobalSettings().theme).toBe("dark");
+			expect(manager.getTheme()).toBe("project");
+		});
+
+		it("refuses unsupported storage, unknown keys, unsafe files and filesystem write denial without mutation", async () => {
+			await expect(SettingsManager.inMemory({ theme: "dark" }).unsetGlobalSettings(["theme"])).rejects.toThrow(
+				"Unset requires file settings storage",
+			);
+			const settingsPath = join(agentDir, "settings.json");
+			const original = '{"theme":"dark","private":"not-in-receipts"}';
+			writeFileSync(settingsPath, original);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			await expect(manager.unsetGlobalSettings(["unknown" as "theme"])).rejects.toThrow("Unknown settings key");
+			linkSync(settingsPath, join(agentDir, "linked"));
+			await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow("Unsafe settings file");
+			rmSync(join(agentDir, "linked"));
+			rmSync(settingsPath);
+			symlinkSync(join(agentDir, "target"), settingsPath);
+			writeFileSync(join(agentDir, "target"), original);
+			await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow("Unsafe settings file");
+			expect(readFileSync(settingsPath, "utf8")).toBe(original);
+			rmSync(settingsPath);
+			writeFileSync(settingsPath, original);
+			chmodSync(agentDir, 0o500);
+			try {
+				await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow();
+				expect(readFileSync(settingsPath, "utf8")).toBe(original);
+				expect(manager.getTheme()).toBe("dark");
+			} finally {
+				chmodSync(agentDir, 0o700);
+			}
 		});
 	});
 

@@ -3,13 +3,108 @@
  * Used by auth-storage.ts and model-registry.ts.
  */
 
-import { execSync, spawnSync } from "child_process";
+import { existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
+import { execSync, spawn, spawnSync } from "child_process";
 import { getShellConfig } from "../utils/shell.ts";
 
 // Cache for shell command results (persists for process lifetime)
 const commandResultCache = new Map<string, string | undefined>();
 const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENV_VAR_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
+
+export type CredentialReference =
+	| { source: "1password"; reference: string; format?: "bearer" }
+	| { source: "keychain"; service: string; account: string; format?: "bearer" };
+
+export type ConfigValue = string | CredentialReference;
+
+export interface CredentialReferenceOptions {
+	signal?: AbortSignal;
+	opExecutable?: string;
+}
+
+export function isCredentialReference(value: unknown): value is CredentialReference {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const entry = value as Record<string, unknown>;
+	const data = (field: unknown): field is string =>
+		typeof field === "string" && field.trim().length > 0 && field.length <= 2048 && !/[\x00-\x1f\x7f]/.test(field);
+	if (entry.format !== undefined && entry.format !== "bearer") return false;
+	if (entry.source === "1password") {
+		return (
+			Object.keys(entry).every((key) => ["source", "reference", "format"].includes(key)) &&
+			data(entry.reference) &&
+			/^op:\/\/[^/?#]+\/[^/?#]+\/(?:[^/?#]+\/)?[^/?#]+$/.test(entry.reference) &&
+			entry.reference
+				.slice(5)
+				.split("/")
+				.every((part) => part.trim().length > 0)
+		);
+	}
+	return (
+		entry.source === "keychain" &&
+		Object.keys(entry).every((key) => ["source", "service", "account", "format"].includes(key)) &&
+		data(entry.service) &&
+		data(entry.account)
+	);
+}
+
+export async function resolveConfigValueAsync(
+	config: ConfigValue,
+	options: CredentialReferenceOptions = {},
+	description = "configuration value",
+): Promise<string> {
+	if (options.signal?.aborted) throw new Error("Credential resolution cancelled");
+	if (typeof config === "string") return resolveConfigValueOrThrow(config, description);
+	if (!isCredentialReference(config)) throw new Error("Invalid credential reference");
+	let executable: string;
+	let args: string[];
+	if (config.source === "1password") {
+		const paths =
+			process.platform === "darwin"
+				? ["/opt/homebrew/bin/op", "/usr/local/bin/op"]
+				: ["/usr/local/bin/op", "/usr/bin/op"];
+		executable = options.opExecutable ?? paths.find((path) => existsSync(path)) ?? "";
+		if (!isAbsolute(executable)) throw new Error("Credential resolver unavailable");
+		args = ["read", "--no-newline", config.reference];
+	} else {
+		if (process.platform !== "darwin") throw new Error("Credential resolver unavailable");
+		executable = "/usr/bin/security";
+		args = ["find-generic-password", "-s", config.service, "-a", config.account, "-w"];
+	}
+	const value = await new Promise<string>((resolve, reject) => {
+		const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+		const chunks: Buffer[] = [];
+		let bytes = 0;
+		let failure: string | undefined;
+		const stop = (reason: string) => {
+			failure ??= reason;
+			child.kill("SIGKILL");
+			child.stdout.destroy();
+		};
+		const abort = () => stop("Credential resolution cancelled");
+		const timer = setTimeout(() => stop("Credential resolution timed out"), 10_000);
+		options.signal?.addEventListener("abort", abort, { once: true });
+		child.on("error", () => {
+			failure ??= "Credential resolver unavailable";
+		});
+		child.stdout.on("data", (chunk: Buffer) => {
+			bytes += chunk.length;
+			if (bytes > 64 * 1024) stop("Credential output exceeded limit");
+			else chunks.push(chunk);
+		});
+		child.once("close", (code) => {
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", abort);
+			const output = failure ? "" : Buffer.concat(chunks).toString("utf8").trim();
+			if (failure || code !== 0 || !output || /[\x00\r\n]/.test(output)) {
+				reject(new Error(failure ?? "Credential resolution failed"));
+			} else resolve(output);
+		});
+		if (options.signal?.aborted) abort();
+	});
+	return config.format === "bearer" ? `Bearer ${value}` : value;
+}
 
 type TemplatePart = { type: "literal"; value: string } | { type: "env"; name: string };
 

@@ -109,6 +109,16 @@ Each boundary can be supplied explicitly:
 
 Use `DefaultResourceLoader` when you want standard discovery with selected overrides. Supply a custom `ResourceLoader` when the host owns resource storage and discovery completely.
 
+### Remove global settings with a backup
+
+`await settingsManager.unsetGlobalSettings(["theme", "hideThinkingBlock"])` removes declared top-level keys from file-backed global settings. It does not remove project overrides or change the host's approval policy. In-memory/custom storage and unknown keys are refused. An absent key is a no-op, without a backup.
+
+The operation shares the settings write queue and file lock with setters. It reads the current file under that lock, preserves unknown and unrelated fields, and writes an exclusive, exact-byte `0600` backup beside `settings.json`. The backup and its directory are flushed before an atomic replacement, which is also flushed. Symlinked/nonregular/multiply linked settings files and detected file or directory identity changes are refused. This relies on the settings lock for cooperating writers; it is not an operating-system sandbox against an adversarial writer racing rename. Directory flushing requires a supporting filesystem. A failure before rename leaves the canonical file unchanged; a failure flushing after rename rejects as durability uncertain, never as applied. Retained backup files are not pruned automatically.
+
+The promise rejects on refusal or error; queued storage errors are also recorded by `drainErrors()`. A successful receipt contains only `status: "unchanged"` and `changedKeys: []`, or `status: "applied"`, changed key names, `backupPath`, and before/after SHA-256 digests. It never contains setting values. Await this promise for its own result; `flush()` joins the queue but retains its existing error-collection behavior. Later setters remain ordered after deletion and can intentionally set a removed key again. Effective getters still include project settings.
+
+Restore is an explicit host action: stop writers, verify the receipt's backup SHA-256, and atomically replace global `settings.json` from that backup with private permissions and filesystem flushing, then reload the manager. There is no automatic restore reader or fallback.
+
 <a id="inlineextension"></a>
 
 Inline extension factories can be supplied through `DefaultResourceLoader`. Give one an `InlineExtension` name only when it needs a stable name in diagnostics and startup output. A named inline extension with `replaceable: true` is left out when another extension registers a tool, command, or flag with a name it registers during loading, instead of both loading with a conflict. The CLI's built-in codemode, tool search, and MCP extensions are replaceable. A named entry with `builtin: true` is not an inline extension: it supplies the code of the `builtin:<name>` extension, which loads like a configured extension file. It loads by default, is listed in `pi config`, and is disabled by `-builtin:<name>` in the `extensions` setting or by `noExtensions`; `additionalExtensionPaths: ["builtin:<name>"]` loads it explicitly. It loads after project trust is resolved, so it cannot handle `project_trust`. The CLI's built-in extensions use it.
