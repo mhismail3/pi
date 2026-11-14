@@ -1,8 +1,18 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { renderToolOutputType } from "@earendil-works/pi-codemode/declarations";
 import {
 	createMcpToolName,
@@ -181,6 +191,27 @@ describe("MCP config", () => {
 		const trusted = loadMcpConfig({ ...paths, projectTrusted: true });
 		expect(trusted.autoEnableCodemode).toBe(false);
 		expect(trusted.errors).toContainEqual(expect.stringContaining("autoEnableCodemode must be a boolean"));
+	});
+
+	it("validates reference data without resolving it during inventory", () => {
+		const reference = { source: "1password", reference: "op://vault/item/field", format: "bearer" };
+		const keychain = { source: "keychain", service: "service", account: "account" };
+		const paths = setup(
+			{
+				mcpServers: {
+					remote: { url: "https://example.com/mcp", headers: { Authorization: reference }, enabled: false },
+					local: { command: "unused", env: { TOKEN: keychain }, enabled: false },
+					bad: { command: "unused", env: { TOKEN: { ...keychain, executable: "untrusted" } } },
+				},
+			},
+			{},
+		);
+		const { servers, errors } = loadMcpConfig({ ...paths, projectTrusted: false });
+		expect(servers.map((entry) => entry.config)).toEqual([
+			{ url: "https://example.com/mcp", headers: { Authorization: reference }, enabled: false },
+			{ command: "unused", env: { TOKEN: keychain }, enabled: false },
+		]);
+		expect(errors).toEqual([expect.stringContaining("strings or credential references")]);
 	});
 
 	it("validates the OAuth callback URL, scope, and client name", () => {
@@ -571,6 +602,81 @@ for await (const line of createInterface({ input: process.stdin })) {
 			}
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"resolves typed references at the real connection boundary without a shell or diagnostic leaks",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-mcp-reference-"));
+			const executable = join(root, "op");
+			const argv = join(root, "argv.json");
+			writeFileSync(
+				executable,
+				`#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(argv)}, JSON.stringify(process.argv.slice(2)));\nprocess.stderr.write('private-resolver-diagnostic');\nprocess.exit(1);\n`,
+			);
+			chmodSync(executable, 0o700);
+			const reference = "op://vault/item/field ; $() | 'quoted'";
+			const connection = new McpServerConnection({
+				entry: {
+					name: "reference",
+					source: "test",
+					config: {
+						url: "https://unused.invalid",
+						headers: { Authorization: { source: "1password", reference, format: "bearer" } },
+					},
+				},
+				cwd: root,
+				createTransport: (entry, cwd, auth, signal) =>
+					createDefaultTransport(entry, cwd, auth, signal, { opExecutable: executable }),
+				credentials: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()),
+				onTools: () => {},
+			});
+			try {
+				expect(existsSync(argv)).toBe(false);
+				await expect(connection.getClient()).rejects.toThrow(
+					/^MCP server "reference" failed to connect: Credential resolution failed$/,
+				);
+				expect(JSON.parse(readFileSync(argv, "utf8"))).toEqual(["read", "--no-newline", reference]);
+				expect(connection.error).toBe("Credential resolution failed");
+			} finally {
+				await connection.close();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")("joins reference resolution before connection close returns", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-mcp-reference-close-"));
+		const executable = join(root, "op");
+		const pidFile = join(root, "pid");
+		writeFileSync(
+			executable,
+			`#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+		);
+		chmodSync(executable, 0o700);
+		const connection = new McpServerConnection({
+			entry: {
+				name: "reference",
+				source: "test",
+				config: { command: "unused", env: { TOKEN: { source: "1password", reference: "op://vault/item/field" } } },
+			},
+			cwd: root,
+			createTransport: (entry, cwd, auth, signal) =>
+				createDefaultTransport(entry, cwd, auth, signal, { opExecutable: executable }),
+			credentials: new McpOAuthCredentialStore(new InMemoryAuthStorageBackend()),
+			onTools: () => {},
+		});
+		const opening = expect(connection.getClient()).rejects.toThrow("Credential resolution cancelled");
+		try {
+			for (let attempt = 0; !existsSync(pidFile) && attempt < 200; attempt++) await sleep(10);
+			expect(existsSync(pidFile)).toBe(true);
+			await connection.close();
+			await opening;
+			expect(() => process.kill(Number(readFileSync(pidFile, "utf8")), 0)).toThrow();
+		} finally {
+			await connection.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	it("connects to servers without the tools capability without listing tools", async () => {
 		const methods: string[] = [];
