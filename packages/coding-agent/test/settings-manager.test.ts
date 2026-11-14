@@ -1,5 +1,6 @@
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "crypto";
-import {
+import fs, {
 	chmodSync,
 	existsSync,
 	linkSync,
@@ -13,7 +14,8 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import lockfile from "proper-lockfile";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
 
@@ -32,6 +34,8 @@ describe("SettingsManager", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
+		syncBuiltinESMExports();
 		if (existsSync(testDir)) {
 			rmSync(testDir, { recursive: true });
 		}
@@ -129,7 +133,7 @@ describe("SettingsManager", () => {
 			const original = Buffer.from('\uFEFF{ "theme": "dark", "hideThinkingBlock": true, "custom": {"keep": 1} }\n');
 			writeFileSync(settingsPath, original);
 			const manager = SettingsManager.create(projectDir, agentDir);
-			const unset = manager.unsetGlobalSettings(["theme", "hideThinkingBlock"]);
+			const unset = manager.unsetGlobalSettings(["theme", "hideThinkingBlock", "theme"]);
 			manager.setDefaultThinkingLevel("high");
 			const receipt = await unset;
 			await manager.flush();
@@ -138,6 +142,12 @@ describe("SettingsManager", () => {
 			expect(readFileSync(receipt.backupPath)).toEqual(original);
 			expect(statSync(receipt.backupPath).mode & 0o777).toBe(0o600);
 			expect(receipt.beforeSha256).toBe(createHash("sha256").update(original).digest("hex"));
+			expect(receipt.afterSha256).toBe(
+				createHash("sha256")
+					.update(`${JSON.stringify({ custom: { keep: 1 } }, null, 2)}\n`)
+					.digest("hex"),
+			);
+			expect(statSync(settingsPath).mode & 0o777).toBe(0o600);
 			expect(receipt.changedKeys).toEqual(["theme", "hideThinkingBlock"]);
 			expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual({
 				custom: { keep: 1 },
@@ -147,6 +157,8 @@ describe("SettingsManager", () => {
 			expect(manager.getHideThinkingBlock()).toBe(false);
 			expect(SettingsManager.create(projectDir, agentDir).getGlobalSettings()).toEqual(manager.getGlobalSettings());
 			expect(await manager.unsetGlobalSettings(["theme"])).toEqual({ status: "unchanged", changedKeys: [] });
+			expect(await manager.unsetGlobalSettings([])).toEqual({ status: "unchanged", changedKeys: [] });
+			expect(manager.drainErrors()).toEqual([]);
 			expect(readdirSync(agentDir).filter((name) => name.includes(".backup-"))).toHaveLength(1);
 		});
 
@@ -170,6 +182,342 @@ describe("SettingsManager", () => {
 			expect(manager.getGlobalSettings().theme).toBe("dark");
 			expect(manager.getTheme()).toBe("project");
 		});
+
+		it("retains failed setter ownership after storage repair unless unset explicitly deletes it", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			for (const unset of [false, true]) {
+				writeFileSync(settingsPath, '{"theme":"old"}');
+				const manager = SettingsManager.create(projectDir, agentDir);
+				writeFileSync(settingsPath, "{");
+				manager.setTheme("new");
+				await manager.flush();
+				expect(manager.drainErrors()).toHaveLength(1);
+				writeFileSync(settingsPath, '{"theme":"old"}');
+				if (unset) await manager.unsetGlobalSettings(["theme"]);
+				manager.setDefaultThinkingLevel("high");
+				await manager.flush();
+				const expected = unset ? { defaultThinkingLevel: "high" } : { theme: "new", defaultThinkingLevel: "high" };
+				expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(expected);
+				expect(manager.getGlobalSettings()).toEqual(expected);
+				expect(SettingsManager.create(projectDir, agentDir).getGlobalSettings()).toEqual(expected);
+				expect(manager.drainErrors()).toEqual([]);
+			}
+		});
+
+		it("rebases later nested and map-entry edits onto deletion in memory and on disk", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					compaction: { enabled: true, reserveTokens: 321 },
+					terminal: { showImages: true, trueColor: false },
+					images: { autoResize: true, blockImages: true },
+					retry: { enabled: true, maxRetries: 9 },
+					markdown: { mermaid: "off", codeBlockIndent: "old" },
+					modelThinkingLevels: { "old/model": "low" },
+					extensionChangelogVersions: { old: "1" },
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const unset = manager.unsetGlobalSettings([
+				"compaction",
+				"terminal",
+				"images",
+				"retry",
+				"markdown",
+				"modelThinkingLevels",
+				"extensionChangelogVersions",
+			]);
+			manager.setCompactionEnabled(false);
+			manager.setShowImages(false);
+			manager.setImageAutoResize(false);
+			manager.setRetryEnabled(false);
+			manager.setMermaidRenderingMode("final");
+			manager.setModelThinkingLevel("new", "model", "high");
+			manager.removeModelThinkingLevel("old", "model");
+			manager.setExtensionChangelogVersion("new", "2");
+			await unset;
+			await manager.flush();
+			const expected = {
+				compaction: { enabled: false },
+				terminal: { showImages: false },
+				images: { autoResize: false },
+				retry: { enabled: false },
+				markdown: { mermaid: "final" },
+				modelThinkingLevels: { "new/model": "high" },
+				extensionChangelogVersions: { new: "2" },
+			};
+			expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual(expected);
+			expect(manager.getGlobalSettings()).toEqual(expected);
+			const fresh = SettingsManager.create(projectDir, agentDir);
+			expect(fresh.getGlobalSettings()).toEqual(expected);
+			expect(manager.getCompactionSettings()).toEqual(fresh.getCompactionSettings());
+			expect(manager.getRetrySettings()).toEqual(fresh.getRetrySettings());
+			expect(manager.getTerminalCapabilityOverrides()).toEqual(fresh.getTerminalCapabilityOverrides());
+			expect(manager.getBlockImages()).toBe(fresh.getBlockImages());
+			expect(manager.getCodeBlockIndent()).toBe(fresh.getCodeBlockIndent());
+			expect(manager.drainErrors()).toEqual([]);
+		});
+
+		it("does not create a backup or canonical file for a missing source", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(await manager.unsetGlobalSettings(["theme", "theme"])).toEqual({
+				status: "unchanged",
+				changedKeys: [],
+			});
+			expect(readdirSync(agentDir)).toEqual([]);
+		});
+
+		it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+			"reaches backup creation under the real lock before filesystem write denial",
+			async () => {
+				const settingsPath = join(agentDir, "settings.json");
+				const original = '{"theme":"dark","private":"fixture-only"}';
+				writeFileSync(settingsPath, original);
+				const manager = SettingsManager.create(projectDir, agentDir);
+				const realOpen = fs.openSync;
+				let reachedBackup = false;
+				vi.spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+					if (String(path).includes(".backup-")) {
+						expect(existsSync(`${settingsPath}.lock`)).toBe(true);
+						reachedBackup = true;
+						chmodSync(agentDir, 0o500);
+					}
+					return realOpen(path, flags, mode);
+				});
+				syncBuiltinESMExports();
+				try {
+					await expect(manager.unsetGlobalSettings(["theme"])).rejects.toMatchObject({
+						phase: "backup-create",
+						replacement: "not-attempted",
+						recovery: undefined,
+					});
+					expect(reachedBackup).toBe(true);
+					expect(readFileSync(settingsPath, "utf8")).toBe(original);
+					expect(manager.getTheme()).toBe("dark");
+					expect(
+						readdirSync(agentDir).filter((name) => name.includes(".backup-") || name.includes(".unset-")),
+					).toEqual([]);
+				} finally {
+					chmodSync(agentDir, 0o700);
+				}
+			},
+		);
+
+		it.skipIf(process.platform === "win32")(
+			"reports syscall failure phases and recovery without confusing injected errors with physical durability proof",
+			async () => {
+				const settingsPath = join(agentDir, "settings.json");
+				const original = Buffer.from('{"theme":"dark","private":"fixture-only"}\n');
+				for (const fault of [
+					"backup-sync",
+					"backup-directory-sync",
+					"temporary-sync",
+					"rename",
+					"commit-directory-sync",
+				] as const) {
+					writeFileSync(settingsPath, original);
+					const manager = SettingsManager.create(projectDir, agentDir);
+					const realOpen = fs.openSync;
+					const realSync = fs.fsyncSync;
+					const realRename = fs.renameSync;
+					const paths = new Map<number, string>();
+					let directorySyncs = 0;
+					vi.spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+						const fd = realOpen(path, flags, mode);
+						paths.set(fd, String(path));
+						return fd;
+					});
+					vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+						const path = paths.get(fd);
+						if (path === agentDir) directorySyncs++;
+						if (
+							(fault === "backup-sync" && path?.includes(".backup-")) ||
+							(fault === "backup-directory-sync" && path === agentDir && directorySyncs === 1) ||
+							(fault === "temporary-sync" && path?.includes(".unset-")) ||
+							(fault === "commit-directory-sync" && path === agentDir && directorySyncs === 2)
+						)
+							throw new Error("injected fsync failure");
+						realSync(fd);
+					});
+					vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+						if (fault === "rename") throw new Error("injected rename failure");
+						realRename(source, target);
+					});
+					syncBuiltinESMExports();
+					try {
+						const failure: unknown = await manager
+							.unsetGlobalSettings(["theme"])
+							.catch((error: unknown) => error);
+						const backups = readdirSync(agentDir).filter((name) => name.includes(".backup-"));
+						const backupPath = join(agentDir, backups[backups.length - 1]);
+						const verified = fault !== "backup-sync" && fault !== "backup-directory-sync";
+						expect(failure).toMatchObject({
+							phase: fault,
+							replacement:
+								fault === "rename" || fault === "commit-directory-sync" ? "uncertain" : "not-attempted",
+							recovery: verified
+								? {
+										kind: "verified-backup",
+										backupPath,
+										beforeSha256: createHash("sha256").update(original).digest("hex"),
+									}
+								: { kind: "unverified-backup", backupPath },
+						});
+						expect(readFileSync(backupPath)).toEqual(original);
+						expect(statSync(backupPath).mode & 0o777).toBe(0o600);
+						expect(readFileSync(settingsPath)).toEqual(
+							fault === "commit-directory-sync"
+								? Buffer.from(`${JSON.stringify({ private: "fixture-only" }, null, 2)}\n`)
+								: original,
+						);
+						expect(readdirSync(agentDir).filter((name) => name.includes(".unset-"))).toEqual([]);
+						if (fault === "commit-directory-sync") {
+							manager.setDefaultThinkingLevel("high");
+							await manager.flush();
+							expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual({ private: "fixture-only" });
+							await manager.reload();
+							expect(manager.getGlobalSettings()).toEqual({ private: "fixture-only" });
+						}
+					} finally {
+						vi.restoreAllMocks();
+						syncBuiltinESMExports();
+						for (const name of readdirSync(agentDir).filter((name) => name.includes(".backup-")))
+							rmSync(join(agentDir, name));
+					}
+				}
+			},
+		);
+
+		it.skipIf(process.platform === "win32")(
+			"preserves primary phase and recovery when descriptor close and lock release also fail",
+			async () => {
+				const settingsPath = join(agentDir, "settings.json");
+				writeFileSync(settingsPath, '{"theme":"dark"}');
+				const manager = SettingsManager.create(projectDir, agentDir);
+				const realOpen = fs.openSync;
+				const realSync = fs.fsyncSync;
+				const realClose = fs.closeSync;
+				const realLock = lockfile.lockSync;
+				let directoryFd: number | undefined;
+				let backupFd: number | undefined;
+				vi.spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+					const fd = realOpen(path, flags, mode);
+					if (String(path) === agentDir) directoryFd = fd;
+					if (String(path).includes(".backup-")) backupFd = fd;
+					return fd;
+				});
+				vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+					if (fd === backupFd) throw new Error("primary private-fixture");
+					realSync(fd);
+				});
+				vi.spyOn(fs, "closeSync").mockImplementation((fd) => {
+					realClose(fd);
+					if (fd === directoryFd) throw new Error("secondary private-fixture");
+				});
+				vi.spyOn(lockfile, "lockSync").mockImplementation((path, options) => {
+					const release = realLock(path, options);
+					return () => {
+						release();
+						throw new Error("release private-fixture");
+					};
+				});
+				syncBuiltinESMExports();
+				await expect(manager.unsetGlobalSettings(["theme"])).rejects.toMatchObject({
+					message: "Settings unset refused before commit",
+					phase: "backup-sync",
+					replacement: "not-attempted",
+					recovery: { kind: "unverified-backup" },
+					cleanupFailures: ["close", "release"],
+				});
+				expect(readFileSync(settingsPath, "utf8")).toBe('{"theme":"dark"}');
+				expect(existsSync(`${settingsPath}.lock`)).toBe(false);
+			},
+		);
+
+		it.skipIf(process.platform === "win32")(
+			"refuses real entry and metadata drift and never removes a foreign temporary pathname",
+			async () => {
+				const settingsPath = join(agentDir, "settings.json");
+				const original = '{"theme":"dark"}';
+				for (const fault of [
+					"collision",
+					"file",
+					"mode",
+					"directory-before-read",
+					"directory-after-temporary",
+				] as const) {
+					writeFileSync(settingsPath, original);
+					chmodSync(settingsPath, 0o644);
+					const manager = SettingsManager.create(projectDir, agentDir);
+					const realOpen = fs.openSync;
+					const realSync = fs.fsyncSync;
+					let temporary: string | undefined;
+					let temporaryFd: number | undefined;
+					let drifted = false;
+					const moved = join(testDir, `moved-${fault}`);
+					vi.spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+						const name = String(path);
+						if (name.includes(".unset-") && flags === "wx") {
+							temporary = name;
+							if (fault === "collision") writeFileSync(name, "foreign-collision");
+						}
+						const fd = realOpen(path, flags, mode);
+						if (name === temporary) temporaryFd = fd;
+						if (
+							fault === "directory-before-read" &&
+							name === settingsPath &&
+							typeof flags === "number" &&
+							!drifted
+						) {
+							drifted = true;
+							fs.renameSync(agentDir, moved);
+							mkdirSync(agentDir);
+							fs.renameSync(join(moved, "settings.json"), settingsPath);
+						}
+						return fd;
+					});
+					vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+						realSync(fd);
+						if (fd !== temporaryFd || drifted) return;
+						drifted = true;
+						if (fault === "file") {
+							const other = join(agentDir, "writer");
+							writeFileSync(other, '{"theme":"intervening"}');
+							fs.renameSync(other, settingsPath);
+						}
+						if (fault === "mode") chmodSync(settingsPath, 0o640);
+						if (fault === "directory-after-temporary" && temporary) {
+							fs.renameSync(agentDir, moved);
+							mkdirSync(agentDir);
+							writeFileSync(settingsPath, "intervening-directory");
+							writeFileSync(temporary, "foreign-directory");
+						}
+					});
+					syncBuiltinESMExports();
+					try {
+						await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow();
+						expect(readFileSync(settingsPath, "utf8")).toBe(
+							fault === "file"
+								? '{"theme":"intervening"}'
+								: fault === "directory-after-temporary"
+									? "intervening-directory"
+									: original,
+						);
+						if (fault === "mode") expect(statSync(settingsPath).mode & 0o777).toBe(0o640);
+						if (fault === "collision" || fault === "directory-after-temporary")
+							expect(readFileSync(temporary!, "utf8")).toBe(
+								fault === "collision" ? "foreign-collision" : "foreign-directory",
+							);
+					} finally {
+						vi.restoreAllMocks();
+						syncBuiltinESMExports();
+						for (const name of readdirSync(agentDir))
+							rmSync(join(agentDir, name), { recursive: true, force: true });
+					}
+				}
+			},
+		);
 
 		it("refuses unsupported storage, unknown keys, unsafe files and filesystem write denial without mutation", async () => {
 			await expect(SettingsManager.inMemory({ theme: "dark" }).unsetGlobalSettings(["theme"])).rejects.toThrow(
