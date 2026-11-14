@@ -247,15 +247,15 @@ export class FileSettingsStorage implements SettingsStorage {
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
 	}
 
-	unsetGlobalSettings(keys: readonly (keyof Settings)[]): { receipt: UnsetGlobalSettingsReceipt; settings: Settings } {
+	unsetGlobalSettings(keys: readonly (keyof Settings)[]): UnsetGlobalSettingsReceipt {
 		const path = this.globalSettingsPath;
 		const initial = lstatSync(path, { throwIfNoEntry: false });
-		if (!initial) return { receipt: { status: "unchanged", changedKeys: [] }, settings: {} };
+		if (!initial) return { status: "unchanged", changedKeys: [] };
 		if (!initial.isFile() || initial.nlink !== 1) throw new Error("Unsafe settings file");
 		const release = this.acquireLockSyncWithRetry(path);
 		try {
 			if (!existsSync(path)) {
-				return { receipt: { status: "unchanged", changedKeys: [] }, settings: {} };
+				return { status: "unchanged", changedKeys: [] };
 			}
 			const directory = dirname(path);
 			const realDirectory = realpathSync(directory);
@@ -278,7 +278,7 @@ export class FileSettingsStorage implements SettingsStorage {
 			if (!isMergeableObject(parsed)) throw new Error("Invalid settings file");
 			const changedKeys = keys.filter((key) => Object.hasOwn(parsed, key));
 			if (changedKeys.length === 0) {
-				return { receipt: { status: "unchanged", changedKeys: [] }, settings: parsed as Settings };
+				return { status: "unchanged", changedKeys: [] };
 			}
 			for (const key of changedKeys) delete parsed[key];
 			const next = Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`);
@@ -341,14 +341,11 @@ export class FileSettingsStorage implements SettingsStorage {
 				if (existsSync(temporary)) unlinkSync(temporary);
 			}
 			return {
-				receipt: {
-					status: "applied",
-					changedKeys,
-					backupPath,
-					beforeSha256: createHash("sha256").update(original).digest("hex"),
-					afterSha256: createHash("sha256").update(next).digest("hex"),
-				},
-				settings: parsed as Settings,
+				status: "applied",
+				changedKeys,
+				backupPath,
+				beforeSha256: createHash("sha256").update(original).digest("hex"),
+				afterSha256: createHash("sha256").update(next).digest("hex"),
 			};
 		} finally {
 			release();
@@ -815,14 +812,10 @@ export class SettingsManager {
 		const revisions = new Map(this.fieldRevisions);
 		const operation = this.writeQueue.then(() => {
 			if (this.globalSettingsLoadError) throw new Error("Global settings could not be loaded");
-			const { receipt, settings } = storage.unsetGlobalSettings(requested);
-			const updated = SettingsManager.migrateSettings(settings as Record<string, unknown>);
-			for (const [field, revision] of this.fieldRevisions) {
-				if (revision !== revisions.get(field)) {
-					(updated as Record<string, unknown>)[field] = this.globalSettings[field];
-				}
+			const receipt = storage.unsetGlobalSettings(requested);
+			for (const field of requested) {
+				if (this.fieldRevisions.get(field) === revisions.get(field)) delete this.globalSettings[field];
 			}
-			this.globalSettings = updated;
 			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 			return receipt;
 		});
