@@ -15,6 +15,7 @@ import {
 	readFileSync,
 	realpathSync,
 	renameSync,
+	type Stats,
 	unlinkSync,
 	writeFileSync,
 } from "fs";
@@ -199,6 +200,42 @@ export type UnsetGlobalSettingsReceipt =
 			afterSha256: string;
 	  };
 
+export type SettingsUnsetRecovery =
+	| { kind: "verified-backup"; backupPath: string; beforeSha256: string }
+	| { kind: "unverified-backup"; backupPath: string };
+
+export class SettingsUnsetError extends Error {
+	readonly phase: string;
+	readonly replacement: "not-attempted" | "uncertain";
+	readonly recovery: SettingsUnsetRecovery | undefined;
+	readonly cleanupFailures: readonly string[];
+
+	constructor(
+		phase: string,
+		replacement: "not-attempted" | "uncertain",
+		recovery: SettingsUnsetRecovery | undefined,
+		cleanupFailures: readonly string[],
+		reason?: "unsafe" | "invalid",
+	) {
+		super(
+			replacement === "uncertain"
+				? "Settings unset durability uncertain"
+				: reason === "unsafe"
+					? "Unsafe settings file"
+					: reason === "invalid"
+						? "Invalid settings file"
+						: "Settings unset refused before commit",
+		);
+		this.name = "SettingsUnsetError";
+		this.phase = phase;
+		this.replacement = replacement;
+		this.recovery = recovery;
+		this.cleanupFailures = cleanupFailures;
+	}
+}
+
+type SettingsMutation = { field: keyof Settings; nestedKey?: string; value: unknown };
+
 type SettingsPaths = Partial<Record<SettingsScope, string>>;
 
 function toSettingsError(scope: SettingsScope, error: unknown, path?: string): SettingsError {
@@ -249,107 +286,197 @@ export class FileSettingsStorage implements SettingsStorage {
 
 	unsetGlobalSettings(keys: readonly (keyof Settings)[]): UnsetGlobalSettingsReceipt {
 		const path = this.globalSettingsPath;
-		const initial = lstatSync(path, { throwIfNoEntry: false });
-		if (!initial) return { status: "unchanged", changedKeys: [] };
-		if (!initial.isFile() || initial.nlink !== 1) throw new Error("Unsafe settings file");
-		const release = this.acquireLockSyncWithRetry(path);
-		try {
-			if (!existsSync(path)) {
-				return { status: "unchanged", changedKeys: [] };
+		const directory = dirname(path);
+		const descriptors: number[] = [];
+		let phase = "read";
+		let reason: "unsafe" | "invalid" | undefined;
+		let failure: { phase: string; reason?: "unsafe" | "invalid" } | undefined;
+		let release: (() => void) | undefined;
+		let directoryIdentity: Stats | undefined;
+		let realDirectory: string | undefined;
+		let temporary: string | undefined;
+		let temporaryIdentity: Stats | undefined;
+		let renamed = false;
+		let renameAttempted = false;
+		let recovery: SettingsUnsetRecovery | undefined;
+		let receipt: UnsetGlobalSettingsReceipt | undefined;
+		const cleanupFailures: string[] = [];
+		const open = (file: string, flags: string | number, mode?: number): number => {
+			const fd = openSync(file, flags, mode);
+			descriptors.push(fd);
+			return fd;
+		};
+		const sameDirectory = (): boolean => {
+			const current = lstatSync(directory, { throwIfNoEntry: false });
+			return (
+				!!current?.isDirectory() &&
+				current.dev === directoryIdentity?.dev &&
+				current.ino === directoryIdentity.ino &&
+				realpathSync(directory) === realDirectory
+			);
+		};
+		const assertDirectory = () => {
+			if (!sameDirectory()) throw new Error();
+		};
+		const assertSource = (identity: Stats) => {
+			if (
+				!identity.isFile() ||
+				identity.nlink !== 1 ||
+				identity.uid !== process.getuid?.() ||
+				(identity.mode & 0o600) !== 0o600 ||
+				(identity.mode & 0o7777 & ~0o644) !== 0
+			) {
+				reason = "unsafe";
+				throw new Error();
 			}
-			const directory = dirname(path);
-			const realDirectory = realpathSync(directory);
-			const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-			let original: Buffer;
-			let identity: ReturnType<typeof fstatSync>;
+		};
+		const settle = (stage: string, cleanup: () => void) => {
 			try {
-				identity = fstatSync(fd);
-				if (!identity.isFile() || identity.nlink !== 1) throw new Error("Unsafe settings file");
-				original = readFileSync(fd);
-			} finally {
-				closeSync(fd);
+				cleanup();
+			} catch {
+				if (!failure) failure = { phase: stage };
+				else cleanupFailures.push(stage);
 			}
+		};
+		const apply = (): UnsetGlobalSettingsReceipt => {
+			const initialDirectory = lstatSync(directory, { throwIfNoEntry: false });
+			if (!initialDirectory) return { status: "unchanged", changedKeys: [] };
+			if (!initialDirectory.isDirectory()) {
+				reason = "unsafe";
+				throw new Error();
+			}
+			const directoryFd = open(directory, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+			directoryIdentity = fstatSync(directoryFd);
+			realDirectory = realpathSync(directory);
+			if (initialDirectory.dev !== directoryIdentity.dev || initialDirectory.ino !== directoryIdentity.ino)
+				throw new Error();
+			assertDirectory();
+			const initial = lstatSync(path, { throwIfNoEntry: false });
+			if (!initial) return { status: "unchanged", changedKeys: [] };
+			assertSource(initial);
+			phase = "lock";
+			release = this.acquireLockSyncWithRetry(path);
+			phase = "read";
+			assertDirectory();
+			if (!lstatSync(path, { throwIfNoEntry: false })) return { status: "unchanged", changedKeys: [] };
+			const fd = open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+			const identity = fstatSync(fd);
+			assertSource(identity);
+			const original = readFileSync(fd);
+			assertDirectory();
 			let parsed: unknown;
 			try {
-				parsed = JSON.parse(stripBom(original.toString("utf8")));
+				parsed = JSON.parse(stripBom(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(original)));
 			} catch {
-				throw new Error("Invalid settings file");
+				reason = "invalid";
+				throw new Error();
 			}
-			if (!isMergeableObject(parsed)) throw new Error("Invalid settings file");
+			if (!isMergeableObject(parsed)) {
+				reason = "invalid";
+				throw new Error();
+			}
 			const changedKeys = keys.filter((key) => Object.hasOwn(parsed, key));
-			if (changedKeys.length === 0) {
-				return { status: "unchanged", changedKeys: [] };
-			}
+			if (changedKeys.length === 0) return { status: "unchanged", changedKeys: [] };
 			for (const key of changedKeys) delete parsed[key];
 			const next = Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`);
+			const beforeSha256 = createHash("sha256").update(original).digest("hex");
 			const backupPath = `${path}.backup-${randomUUID()}`;
-			const temporary = `${path}.unset-${randomUUID()}`;
-			const directoryFd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
-			let renamed = false;
-			try {
-				const directoryIdentity = fstatSync(directoryFd);
-				const backupFd = openSync(backupPath, "wx", 0o600);
-				try {
-					fchmodSync(backupFd, 0o600);
-					writeFileSync(backupFd, original);
-					fsyncSync(backupFd);
-				} finally {
-					closeSync(backupFd);
-				}
-				fsyncSync(directoryFd);
-				const temporaryFd = openSync(temporary, "wx", 0o600);
-				try {
-					fchmodSync(temporaryFd, 0o600);
-					writeFileSync(temporaryFd, next);
-					fsyncSync(temporaryFd);
-				} finally {
-					closeSync(temporaryFd);
-				}
-				const currentDirectory = lstatSync(directory);
-				if (
-					realpathSync(directory) !== realDirectory ||
-					currentDirectory.dev !== directoryIdentity.dev ||
-					currentDirectory.ino !== directoryIdentity.ino ||
-					!currentDirectory.isDirectory()
-				) {
-					throw new Error("Settings directory changed during unset");
-				}
-				const currentFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-				try {
-					const current = fstatSync(currentFd);
-					if (
-						!current.isFile() ||
-						current.nlink !== 1 ||
-						current.dev !== identity.dev ||
-						current.ino !== identity.ino ||
-						current.size !== identity.size ||
-						current.mtimeMs !== identity.mtimeMs ||
-						!readFileSync(currentFd).equals(original)
-					) {
-						throw new Error("Settings changed during unset");
-					}
-				} finally {
-					closeSync(currentFd);
-				}
-				renameSync(temporary, path);
-				renamed = true;
-				fsyncSync(directoryFd);
-			} catch {
-				throw new Error(renamed ? "Settings unset durability uncertain" : "Settings unset refused before commit");
-			} finally {
-				closeSync(directoryFd);
-				if (existsSync(temporary)) unlinkSync(temporary);
-			}
+			phase = "backup-create";
+			assertDirectory();
+			const backupFd = open(backupPath, "wx", 0o600);
+			recovery = { kind: "unverified-backup", backupPath };
+			phase = "backup-write";
+			fchmodSync(backupFd, 0o600);
+			writeFileSync(backupFd, original);
+			phase = "backup-sync";
+			fsyncSync(backupFd);
+			phase = "backup-directory-sync";
+			assertDirectory();
+			fsyncSync(directoryFd);
+			recovery = { kind: "verified-backup", backupPath, beforeSha256 };
+			temporary = `${path}.unset-${randomUUID()}`;
+			phase = "temporary-create";
+			assertDirectory();
+			const temporaryFd = open(temporary, "wx", 0o600);
+			temporaryIdentity = fstatSync(temporaryFd);
+			phase = "temporary-write";
+			fchmodSync(temporaryFd, 0o600);
+			writeFileSync(temporaryFd, next);
+			phase = "temporary-sync";
+			fsyncSync(temporaryFd);
+			phase = "validate";
+			assertDirectory();
+			const currentFd = open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+			const current = fstatSync(currentFd);
+			assertSource(current);
+			if (
+				current.dev !== identity.dev ||
+				current.ino !== identity.ino ||
+				current.size !== identity.size ||
+				current.mtimeMs !== identity.mtimeMs ||
+				current.ctimeMs !== identity.ctimeMs ||
+				current.mode !== identity.mode ||
+				current.uid !== identity.uid ||
+				current.gid !== identity.gid ||
+				!readFileSync(currentFd).equals(original)
+			)
+				throw new Error();
+			const currentTemporary = lstatSync(temporary);
+			if (
+				!currentTemporary.isFile() ||
+				currentTemporary.nlink !== 1 ||
+				currentTemporary.dev !== temporaryIdentity.dev ||
+				currentTemporary.ino !== temporaryIdentity.ino ||
+				(currentTemporary.mode & 0o7777) !== 0o600 ||
+				currentTemporary.size !== next.length
+			)
+				throw new Error();
+			assertDirectory();
+			phase = "rename";
+			renameAttempted = true;
+			renameSync(temporary, path);
+			renamed = true;
+			phase = "commit-directory-sync";
+			fsyncSync(directoryFd);
 			return {
 				status: "applied",
 				changedKeys,
 				backupPath,
-				beforeSha256: createHash("sha256").update(original).digest("hex"),
+				beforeSha256,
 				afterSha256: createHash("sha256").update(next).digest("hex"),
 			};
+		};
+		try {
+			receipt = apply();
+		} catch {
+			failure = { phase, reason };
 		} finally {
-			release();
+			if (temporary && temporaryIdentity && !renamed) {
+				settle("temporary-cleanup", () => {
+					if (!sameDirectory()) throw new Error();
+					const current = lstatSync(temporary!, { throwIfNoEntry: false });
+					if (!current) return;
+					if (
+						!current.isFile() ||
+						current.dev !== temporaryIdentity!.dev ||
+						current.ino !== temporaryIdentity!.ino
+					)
+						throw new Error();
+					unlinkSync(temporary!);
+				});
+			}
+			for (const fd of descriptors.reverse()) settle("close", () => closeSync(fd));
+			if (release) settle("release", release);
 		}
+		if (failure)
+			throw new SettingsUnsetError(
+				failure.phase,
+				renameAttempted ? "uncertain" : "not-attempted",
+				recovery,
+				cleanupFailures,
+				failure.reason,
+			);
+		return receipt!;
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
@@ -406,9 +533,7 @@ export class SettingsManager {
 	private projectSettings: Settings;
 	private settings: Settings;
 	private projectTrusted: boolean;
-	private fieldRevisions = new Map<keyof Settings, number>();
-	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
-	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
+	private globalMutations: SettingsMutation[] = [];
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
@@ -635,13 +760,12 @@ export class SettingsManager {
 		if (!globalLoad.error) {
 			this.globalSettings = globalLoad.settings;
 			this.globalSettingsLoadError = null;
+			this.globalMutations = [];
 		} else {
 			this.globalSettingsLoadError = globalLoad.error;
 			this.recordError("global", globalLoad.error);
 		}
 
-		this.modifiedFields.clear();
-		this.modifiedNestedFields.clear();
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
 
@@ -662,16 +786,30 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
-	/** Mark a global field as modified during this session */
-	private markModified(field: keyof Settings, nestedKey?: string): void {
-		this.modifiedFields.add(field);
-		this.fieldRevisions.set(field, (this.fieldRevisions.get(field) ?? 0) + 1);
-		if (nestedKey) {
-			if (!this.modifiedNestedFields.has(field)) {
-				this.modifiedNestedFields.set(field, new Set());
-			}
-			this.modifiedNestedFields.get(field)!.add(nestedKey);
+	private static captureMutation(settings: Settings, field: keyof Settings, nestedKey?: string): SettingsMutation {
+		const value =
+			nestedKey === undefined
+				? settings[field]
+				: (settings[field] as Record<string, unknown> | undefined)?.[nestedKey];
+		return { field, nestedKey, value: structuredClone(value) };
+	}
+
+	private static applyMutation(settings: Settings, { field, nestedKey, value }: SettingsMutation): void {
+		const target = settings as Record<string, unknown>;
+		if (nestedKey === undefined) {
+			if (value === undefined) delete target[field];
+			else target[field] = structuredClone(value);
+			return;
 		}
+		const base = target[field];
+		const nested = { ...(isMergeableObject(base) ? base : {}), [nestedKey]: structuredClone(value) };
+		if (value === undefined) delete nested[nestedKey];
+		if (Object.keys(nested).length === 0) delete target[field];
+		else target[field] = nested;
+	}
+
+	private markModified(field: keyof Settings, nestedKey?: string): void {
+		this.globalMutations.push(SettingsManager.captureMutation(this.globalSettings, field, nestedKey));
 	}
 
 	/** Mark a project field as modified during this session */
@@ -695,15 +833,9 @@ export class SettingsManager {
 		this.errors.push(toSettingsError(scope, error, this.settingsPaths[scope]));
 	}
 
-	private clearModifiedScope(scope: SettingsScope): void {
-		if (scope === "global") {
-			this.modifiedFields.clear();
-			this.modifiedNestedFields.clear();
-			return;
-		}
-
-		this.modifiedProjectFields.clear();
-		this.modifiedProjectNestedFields.clear();
+	private assertGlobalSettingsLoaded(): void {
+		const error = this.globalSettingsLoadError;
+		if (error) throw error instanceof SettingsUnsetError ? error : new Error("Global settings could not be loaded");
 	}
 
 	private enqueueWrite(scope: SettingsScope, task: () => void): void {
@@ -713,48 +845,23 @@ export class SettingsManager {
 					this.assertProjectTrustedForWrite();
 				}
 				task();
-				if (scope === "project") this.clearModifiedScope(scope);
+				if (scope === "project") {
+					this.modifiedProjectFields.clear();
+					this.modifiedProjectNestedFields.clear();
+				}
 			})
 			.catch((error) => {
 				this.recordError(scope, error);
 			});
 	}
 
-	private cloneModifiedNestedFields(source: Map<keyof Settings, Set<string>>): Map<keyof Settings, Set<string>> {
-		const snapshot = new Map<keyof Settings, Set<string>>();
-		for (const [key, value] of source.entries()) {
-			snapshot.set(key, new Set(value));
-		}
-		return snapshot;
-	}
-
-	private persistScopedSettings(
-		scope: SettingsScope,
-		snapshotSettings: Settings,
-		modifiedFields: Set<keyof Settings>,
-		modifiedNestedFields: Map<keyof Settings, Set<string>>,
-	): void {
+	private persistScopedSettings(scope: SettingsScope, mutations: readonly SettingsMutation[]): void {
+		if (mutations.length === 0) return;
 		this.storage.withLock(scope, (current) => {
-			const currentFileSettings = current
+			const mergedSettings = current
 				? SettingsManager.migrateSettings(JSON.parse(stripBom(current)) as Record<string, unknown>)
 				: {};
-			const mergedSettings: Settings = { ...currentFileSettings };
-			for (const field of modifiedFields) {
-				const value = snapshotSettings[field];
-				if (modifiedNestedFields.has(field) && typeof value === "object" && value !== null) {
-					const nestedModified = modifiedNestedFields.get(field)!;
-					const baseNested = (currentFileSettings[field] as Record<string, unknown>) ?? {};
-					const inMemoryNested = value as Record<string, unknown>;
-					const mergedNested = { ...baseNested };
-					for (const nestedKey of nestedModified) {
-						mergedNested[nestedKey] = inMemoryNested[nestedKey];
-					}
-					(mergedSettings as Record<string, unknown>)[field] = mergedNested;
-				} else {
-					(mergedSettings as Record<string, unknown>)[field] = value;
-				}
-			}
-
+			for (const mutation of mutations) SettingsManager.applyMutation(mergedSettings, mutation);
 			return JSON.stringify(mergedSettings, null, 2);
 		});
 	}
@@ -766,13 +873,14 @@ export class SettingsManager {
 			return;
 		}
 
-		const snapshotGlobalSettings = structuredClone(this.globalSettings);
-		const modifiedFields = new Set(this.modifiedFields);
-		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedNestedFields);
-		this.clearModifiedScope("global");
-
+		const through = this.globalMutations.at(-1);
+		if (!through) return;
 		this.enqueueWrite("global", () => {
-			this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
+			this.assertGlobalSettingsLoaded();
+			const mutations = this.globalMutations.slice(0, this.globalMutations.indexOf(through) + 1);
+			this.persistScopedSettings("global", mutations);
+			const persisted = new Set(mutations);
+			this.globalMutations = this.globalMutations.filter((mutation) => !persisted.has(mutation));
 		});
 	}
 
@@ -785,11 +893,14 @@ export class SettingsManager {
 			return;
 		}
 
-		const snapshotProjectSettings = structuredClone(this.projectSettings);
-		const modifiedFields = new Set(this.modifiedProjectFields);
-		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedProjectNestedFields);
+		const mutations = [...this.modifiedProjectFields].flatMap((field) => {
+			const nested = this.modifiedProjectNestedFields.get(field);
+			return nested
+				? [...nested].map((key) => SettingsManager.captureMutation(this.projectSettings, field, key))
+				: [SettingsManager.captureMutation(this.projectSettings, field)];
+		});
 		this.enqueueWrite("project", () => {
-			this.persistScopedSettings("project", snapshotProjectSettings, modifiedFields, modifiedNestedFields);
+			this.persistScopedSettings("project", mutations);
 		});
 	}
 
@@ -809,12 +920,23 @@ export class SettingsManager {
 		const storage = this.storage;
 		if (!(storage instanceof FileSettingsStorage))
 			return Promise.reject(new Error("Unset requires file settings storage"));
-		const revisions = new Map(this.fieldRevisions);
+		const before = new Set(this.globalMutations);
 		const operation = this.writeQueue.then(() => {
-			if (this.globalSettingsLoadError) throw new Error("Global settings could not be loaded");
-			const receipt = storage.unsetGlobalSettings(requested);
-			for (const field of requested) {
-				if (this.fieldRevisions.get(field) === revisions.get(field)) delete this.globalSettings[field];
+			this.assertGlobalSettingsLoaded();
+			let receipt: UnsetGlobalSettingsReceipt;
+			try {
+				receipt = storage.unsetGlobalSettings(requested);
+			} catch (error) {
+				if (error instanceof SettingsUnsetError && error.replacement === "uncertain")
+					this.globalSettingsLoadError = error;
+				throw error;
+			}
+			this.globalMutations = this.globalMutations.filter(
+				(mutation) => !before.has(mutation) || !requested.includes(mutation.field),
+			);
+			for (const field of requested) delete this.globalSettings[field];
+			for (const mutation of this.globalMutations) {
+				if (requested.includes(mutation.field)) SettingsManager.applyMutation(this.globalSettings, mutation);
 			}
 			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 			return receipt;
@@ -954,7 +1076,7 @@ export class SettingsManager {
 			this.globalSettings.modelThinkingLevels = {};
 		}
 		this.globalSettings.modelThinkingLevels[`${provider}/${modelId}`] = level;
-		this.markModified("modelThinkingLevels");
+		this.markModified("modelThinkingLevels", `${provider}/${modelId}`);
 		this.save();
 	}
 
@@ -964,7 +1086,7 @@ export class SettingsManager {
 		if (Object.keys(this.globalSettings.modelThinkingLevels).length === 0) {
 			delete this.globalSettings.modelThinkingLevels;
 		}
-		this.markModified("modelThinkingLevels");
+		this.markModified("modelThinkingLevels", `${provider}/${modelId}`);
 		this.save();
 	}
 
