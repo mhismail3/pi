@@ -538,6 +538,15 @@ describe("SettingsManager", () => {
 			expect(readFileSync(settingsPath, "utf8")).toBe(original);
 			rmSync(settingsPath);
 			writeFileSync(settingsPath, original);
+			chmodSync(settingsPath, 0o666);
+			await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow("Unsafe settings file");
+			expect(readFileSync(settingsPath, "utf8")).toBe(original);
+			chmodSync(settingsPath, 0o600);
+			const invalidUtf8 = Buffer.concat([Buffer.from('{"theme":"'), Buffer.from([0xff]), Buffer.from('"}')]);
+			writeFileSync(settingsPath, invalidUtf8);
+			await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow("Invalid settings file");
+			expect(readFileSync(settingsPath)).toEqual(invalidUtf8);
+			writeFileSync(settingsPath, original);
 			chmodSync(agentDir, 0o500);
 			try {
 				await expect(manager.unsetGlobalSettings(["theme"])).rejects.toThrow();
