@@ -1,4 +1,6 @@
+import childProcess from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -24,6 +26,7 @@ describe("resolveConfigValue", () => {
 		if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
 		clearConfigValueCache();
 		vi.restoreAllMocks();
+		syncBuiltinESMExports();
 	});
 
 	test("resolves literals, environment templates, and escapes", () => {
@@ -139,6 +142,131 @@ describe("resolveConfigValue", () => {
 					{ opExecutable: join(tempDir, "missing") },
 				),
 			).rejects.toThrow(/^Credential resolver unavailable$/);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"preserves successful reference bytes and fixed bearer formatting",
+		async () => {
+			const executable = join(tempDir, "op.cjs");
+			const recorded = join(tempDir, "argv.json");
+			const output = " \t\uFEFFfixture-雪\t ";
+			writeFileSync(
+				executable,
+				`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write(Buffer.from(${JSON.stringify(Buffer.from(output).toString("base64"))}, 'base64'));\n`,
+			);
+			chmodSync(executable, 0o700);
+			const reference = "op://vault/item/field ; $() | 'quoted'";
+			expect(await resolveConfigValueAsync({ source: "1password", reference }, { opExecutable: executable })).toBe(
+				output,
+			);
+			expect(JSON.parse(readFileSync(recorded, "utf8"))).toEqual(["read", "--no-newline", reference]);
+			expect(
+				await resolveConfigValueAsync(
+					{ source: "1password", reference, format: "bearer" },
+					{ opExecutable: executable },
+				),
+			).toBe(`Bearer ${output}`);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")("rejects malformed output without leaking or normalizing it", async () => {
+		const executable = join(tempDir, "op.cjs");
+		for (const output of [
+			Buffer.alloc(0),
+			Buffer.from("\nprivate-fixture\n"),
+			Buffer.from("private-fixture\r\n"),
+			Buffer.from("private-fixture\0"),
+			Buffer.from([0xc3, 0x28]),
+		]) {
+			writeFileSync(
+				executable,
+				`#!${process.execPath}\nprocess.stdout.write(Buffer.from(${JSON.stringify(output.toString("base64"))}, 'base64'));\n`,
+			);
+			chmodSync(executable, 0o700);
+			await expect(
+				resolveConfigValueAsync({ source: "1password", reference: "op://v/i/f" }, { opExecutable: executable }),
+			).rejects.toThrow(/^Credential resolution failed$/);
+		}
+	});
+
+	test.skipIf(process.platform !== "darwin")(
+		"uses Keychain argv and removes only its single CLI terminator with an inert child",
+		async () => {
+			const executable = join(tempDir, "security.cjs");
+			const recorded = join(tempDir, "argv.json");
+			const realSpawn = childProcess.spawn;
+			vi.spyOn(childProcess, "spawn").mockImplementation((command, args, options) => {
+				expect(command).toBe("/usr/bin/security");
+				return realSpawn(executable, args, options);
+			});
+			syncBuiltinESMExports();
+			for (const [output, expected] of [
+				[" \tfixture \t\n", " \tfixture \t"],
+				["private-fixture\n\n", undefined],
+				["private-fixture\r\n", undefined],
+			] as const) {
+				writeFileSync(
+					executable,
+					`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write(${JSON.stringify(output)});\n`,
+				);
+				chmodSync(executable, 0o700);
+				const result = resolveConfigValueAsync({
+					source: "keychain",
+					service: "service ; $()",
+					account: "account 'quoted'",
+				});
+				if (expected === undefined) await expect(result).rejects.toThrow(/^Credential resolution failed$/);
+				else expect(await result).toBe(expected);
+				expect(JSON.parse(readFileSync(recorded, "utf8"))).toEqual([
+					"find-generic-password",
+					"-s",
+					"service ; $()",
+					"-a",
+					"account 'quoted'",
+					"-w",
+				]);
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"refuses pre-abort without starting a child and joins immediate cancellation",
+		async () => {
+			const executable = join(tempDir, "op.cjs");
+			const marker = join(tempDir, "started");
+			writeFileSync(
+				executable,
+				`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+			);
+			chmodSync(executable, 0o700);
+			const realSpawn = childProcess.spawn;
+			const pids: number[] = [];
+			const spawn = vi.spyOn(childProcess, "spawn").mockImplementation((command, args, options) => {
+				const child = realSpawn(command, args, options);
+				if (child.pid !== undefined) pids.push(child.pid);
+				return child;
+			});
+			syncBuiltinESMExports();
+			const pre = new AbortController();
+			pre.abort();
+			await expect(
+				resolveConfigValueAsync(
+					{ source: "1password", reference: "op://v/i/f" },
+					{ opExecutable: executable, signal: pre.signal },
+				),
+			).rejects.toThrow(/^Credential resolution cancelled$/);
+			expect(spawn).not.toHaveBeenCalled();
+			expect(existsSync(marker)).toBe(false);
+			const immediate = new AbortController();
+			const result = resolveConfigValueAsync(
+				{ source: "1password", reference: "op://v/i/f" },
+				{ opExecutable: executable, signal: immediate.signal },
+			);
+			immediate.abort();
+			await expect(result).rejects.toThrow(/^Credential resolution cancelled$/);
+			expect(pids).toHaveLength(1);
+			for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
 		},
 	);
 
