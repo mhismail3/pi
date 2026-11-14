@@ -755,30 +755,40 @@ export class SettingsManager {
 	}
 
 	async reload(): Promise<void> {
-		await this.writeQueue;
-		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
-		if (!globalLoad.error) {
-			this.globalSettings = globalLoad.settings;
-			this.globalSettingsLoadError = null;
-			this.globalMutations = [];
-		} else {
-			this.globalSettingsLoadError = globalLoad.error;
-			this.recordError("global", globalLoad.error);
-		}
+		const before = new Set(this.globalMutations);
+		const operation = this.writeQueue.then(() => {
+			const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
+			if (!globalLoad.error) {
+				this.globalSettings = globalLoad.settings;
+				this.globalSettingsLoadError = null;
+				this.globalMutations = this.globalMutations.filter((mutation) => !before.has(mutation));
+				for (const mutation of this.globalMutations) SettingsManager.applyMutation(this.globalSettings, mutation);
+			} else {
+				this.globalSettingsLoadError = globalLoad.error;
+				this.recordError("global", globalLoad.error);
+			}
 
-		this.modifiedProjectFields.clear();
-		this.modifiedProjectNestedFields.clear();
+			this.modifiedProjectFields.clear();
+			this.modifiedProjectNestedFields.clear();
 
-		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.projectTrusted);
-		if (!projectLoad.error) {
-			this.projectSettings = projectLoad.settings;
-			this.projectSettingsLoadError = null;
-		} else {
-			this.projectSettingsLoadError = projectLoad.error;
-			this.recordError("project", projectLoad.error);
-		}
+			const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.projectTrusted);
+			if (!projectLoad.error) {
+				this.projectSettings = projectLoad.settings;
+				this.projectSettingsLoadError = null;
+			} else {
+				this.projectSettingsLoadError = projectLoad.error;
+				this.recordError("project", projectLoad.error);
+			}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		});
+		this.writeQueue = operation.then(
+			() => undefined,
+			(error) => {
+				this.recordError("global", error);
+			},
+		);
+		return operation;
 	}
 
 	/** Apply additional overrides on top of current settings */
@@ -868,10 +878,6 @@ export class SettingsManager {
 
 	private save(): void {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
-
-		if (this.globalSettingsLoadError) {
-			return;
-		}
 
 		const through = this.globalMutations.at(-1);
 		if (!through) return;
