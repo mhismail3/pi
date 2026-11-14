@@ -771,17 +771,20 @@ for await (const line of createInterface({ input: process.stdin })) {
 					["Authorization", " private-http"],
 					["Authorization", "private-http\t"],
 					["invalid name", "private-http"],
+					["authorization", "private-http"],
 				]) {
 					writeFileSync(executable, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(output)});\n`);
 					chmodSync(executable, 0o700);
 					const errorSink: string[] = [];
+					const headers = { [key]: { source: "1password" as const, reference: "op://v/i/f" } };
+					if (key === "authorization") headers.Authorization = headers[key];
 					const connection = new McpServerConnection({
 						entry: {
 							name: "fixture",
 							source: "test",
 							config: {
 								url: "https://unused.invalid",
-								headers: { [key]: { source: "1password", reference: "op://v/i/f" } },
+								headers,
 							},
 						},
 						cwd: root,
