@@ -68,7 +68,7 @@ import { type McpMenu, type McpUi, showMcpManager } from "./ui.ts";
 export type { McpTransportFactory } from "./runtime.ts";
 
 export interface McpExtensionOptions {
-	/** Defaults to reading `mcp.json` from the agent directory and the trusted project. */
+	/** Defaults to reading `mcp.json` from the agent directory and the trusted project's `ctx.projectDir`. */
 	loadConfig?: (ctx: ExtensionContext) => LoadedMcpConfig;
 	/** Defaults to stdio and streamable HTTP transports built from the server config. */
 	createTransport?: McpTransportFactory;
@@ -294,8 +294,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		/** Whether a prompt already waited for the startup connections since the session started. */
 		let waitedForStartup = false;
 		const startupWaitMs = options.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS;
-		/** Working directory of the session, for stdio servers. */
-		let sessionCwd = process.cwd();
+		/** Project directory of the session, where stdio servers start and their relative `cwd` resolves. */
+		let serverCwd = process.cwd();
 		let credentials = options.credentials;
 		/** The session's model registry, which resolves `auth.provider` tokens. */
 		let modelRegistry: ModelRegistry | undefined;
@@ -568,7 +568,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			if (!isCurrent()) return undefined;
 			const connection = new runtime.McpServerConnection({
 				entry: server.entry,
-				cwd: sessionCwd,
+				cwd: serverCwd,
 				createTransport: options.createTransport ?? runtime.createDefaultTransport,
 				credentials: getCredentials(runtime),
 				providerToken: async (provider) => modelRegistry?.getApiKeyForProvider(provider),
@@ -1119,7 +1119,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			autoEnableCodemode = loaded.autoEnableCodemode ?? true;
 			warnedUnreachable = false;
 			waitedForStartup = false;
-			sessionCwd = ctx.cwd;
+			serverCwd = ctx.projectDir;
 			modelRegistry = ctx.modelRegistry;
 			session = new AbortController();
 			const { signal } = session;
@@ -1342,7 +1342,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 }
 
 function defaultLoadConfig(ctx: ExtensionContext): LoadedMcpConfig {
-	return loadMcpConfig({ agentDir: getAgentDir(), cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
+	return loadMcpConfig({ agentDir: getAgentDir(), cwd: ctx.projectDir, projectTrusted: ctx.isProjectTrusted() });
 }
 
 export default createMcpExtension();

@@ -302,7 +302,13 @@ export function loadProjectContextFiles(options: {
 }
 
 export interface DefaultResourceLoaderOptions {
+	/** Working directory of the session. Context files are discovered from it and its parents. */
 	cwd: string;
+	/**
+	 * Directory whose `.pi` holds project settings, resources, packages, and `SYSTEM.md`. Default: `cwd`.
+	 * Set it to load one project configuration for sessions that run in its subdirectories.
+	 */
+	projectDir?: string;
 	agentDir: string;
 	settingsManager?: SettingsManager;
 	eventBus?: EventBus;
@@ -342,6 +348,7 @@ export interface DefaultResourceLoaderOptions {
 
 export class DefaultResourceLoader implements ResourceLoader {
 	private cwd: string;
+	private projectDir: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
 	private eventBus: EventBus;
@@ -402,14 +409,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	constructor(options: DefaultResourceLoaderOptions) {
 		this.cwd = resolvePath(options.cwd);
+		this.projectDir = options.projectDir ? resolvePath(options.projectDir) : this.cwd;
 		this.agentDir = resolvePath(options.agentDir);
-		this.settingsManager = options.settingsManager ?? SettingsManager.create(this.cwd, this.agentDir);
+		this.settingsManager = options.settingsManager ?? SettingsManager.create(this.projectDir, this.agentDir);
 		this.eventBus = options.eventBus ?? createEventBus();
 		const factories = options.extensionFactories ?? [];
 		this.extensionFactories = factories.filter((input) => !isBuiltinExtension(input));
 		this.builtinExtensions = new Map(factories.filter(isBuiltinExtension).map((input) => [input.name, input]));
 		this.packageManager = new DefaultPackageManager({
 			cwd: this.cwd,
+			projectDir: this.projectDir,
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
 			builtinExtensions: [...this.builtinExtensions.keys()],
@@ -883,7 +892,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			skillsResult = { skills: [], diagnostics: [] };
 		} else {
 			skillsResult = loadSkills({
-				cwd: this.cwd,
+				cwd: this.projectDir,
 				agentDir: this.agentDir,
 				skillPaths,
 				includeDefaults: false,
@@ -906,7 +915,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			promptsResult = { prompts: [], diagnostics: [] };
 		} else {
 			const loaded = loadPromptTemplates({
-				cwd: this.cwd,
+				cwd: this.projectDir,
 				agentDir: this.agentDir,
 				promptPaths,
 				includeDefaults: false,
@@ -1026,10 +1035,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 			join(this.agentDir, "extensions"),
 		];
 		const projectRoots = [
-			join(this.cwd, CONFIG_DIR_NAME, "skills"),
-			join(this.cwd, CONFIG_DIR_NAME, "prompts"),
-			join(this.cwd, CONFIG_DIR_NAME, "themes"),
-			join(this.cwd, CONFIG_DIR_NAME, "extensions"),
+			join(this.projectDir, CONFIG_DIR_NAME, "skills"),
+			join(this.projectDir, CONFIG_DIR_NAME, "prompts"),
+			join(this.projectDir, CONFIG_DIR_NAME, "themes"),
+			join(this.projectDir, CONFIG_DIR_NAME, "extensions"),
 		];
 
 		for (const root of agentRoots) {
@@ -1083,7 +1092,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const themes: Theme[] = [];
 		const diagnostics: ResourceDiagnostic[] = [];
 		if (includeDefaults) {
-			const defaultDirs = [join(this.agentDir, "themes"), join(this.cwd, CONFIG_DIR_NAME, "themes")];
+			const defaultDirs = [join(this.agentDir, "themes"), join(this.projectDir, CONFIG_DIR_NAME, "themes")];
 
 			for (const dir of defaultDirs) {
 				this.loadThemesFromDir(dir, themes, diagnostics, colorMode);
@@ -1243,7 +1252,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private discoverSystemPromptFile(): string | undefined {
-		const projectPath = join(this.cwd, CONFIG_DIR_NAME, "SYSTEM.md");
+		const projectPath = join(this.projectDir, CONFIG_DIR_NAME, "SYSTEM.md");
 		if (this.settingsManager.isProjectTrusted() && existsSync(projectPath)) {
 			return projectPath;
 		}
@@ -1257,7 +1266,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private discoverAppendSystemPromptFile(): string | undefined {
-		const projectPath = join(this.cwd, CONFIG_DIR_NAME, "APPEND_SYSTEM.md");
+		const projectPath = join(this.projectDir, CONFIG_DIR_NAME, "APPEND_SYSTEM.md");
 		if (this.settingsManager.isProjectTrusted() && existsSync(projectPath)) {
 			return projectPath;
 		}
