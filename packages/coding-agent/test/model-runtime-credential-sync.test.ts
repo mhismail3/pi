@@ -372,4 +372,34 @@ describe("ModelRuntime credential synchronization", () => {
 		await expect(login).rejects.toBeInstanceOf(CredentialSynchronizationError);
 		expect(await credentials.read("broken-sync")).toEqual({ type: "api_key", key: "broken-sync-key" });
 	});
+
+	// Tron #2534: a registration starts an unawaited refresh that still reads the credential store.
+	it("settles refreshes started by provider registration", async () => {
+		const listing = Promise.withResolvers<void>();
+		const held = Promise.withResolvers<void>();
+		let lists = 0;
+		const credentials: CredentialStore = {
+			read: async () => undefined,
+			list: async () => {
+				if (++lists === 1) return [];
+				listing.resolve();
+				await held.promise;
+				return [];
+			},
+			modify: async () => undefined,
+			delete: async () => {},
+		};
+		const runtime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+		runtime.registerNativeProvider(provider("registered"));
+		await listing.promise;
+		let settled = false;
+		const settling = runtime.settleCredentialWrites().then(() => {
+			settled = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(settled).toBe(false);
+		held.resolve();
+		await settling;
+		expect(settled).toBe(true);
+	});
 });
