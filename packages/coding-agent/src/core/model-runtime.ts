@@ -187,6 +187,7 @@ export class ModelRuntime implements Models {
 	// A later readiness pass must not overtake an older config read and leave
 	// that detached registration refresh able to start storage work afterwards.
 	private configLoadTail: Promise<void> = Promise.resolve();
+	private readonly registrationRefreshes = new Set<Promise<ModelsRefreshResult>>();
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
 		available: [],
@@ -644,11 +645,19 @@ export class ModelRuntime implements Models {
 	}
 
 	/**
-	 * Wait until credential writes already in progress finish, such as an OAuth refresh started by a
-	 * background catalog refresh. Call before the process exits so a rotated token is not lost.
+	 * Wait until credential work already in progress finishes: refreshes started by provider or virtual
+	 * model registration, and credential writes such as an OAuth refresh started by a background catalog
+	 * refresh. Call before the process exits or its storage is removed, after registrations have stopped.
 	 */
-	settleCredentialWrites(): Promise<void> {
-		return this.credentials.settled();
+	async settleCredentialWrites(): Promise<void> {
+		while (this.registrationRefreshes.size > 0) await Promise.allSettled(this.registrationRefreshes);
+		await this.credentials.settled();
+	}
+
+	private refreshAfterRegistration(): void {
+		const refresh = this.refresh({ allowNetwork: false });
+		this.registrationRefreshes.add(refresh);
+		void refresh.finally(() => this.registrationRefreshes.delete(refresh));
 	}
 
 	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
@@ -889,7 +898,10 @@ export class ModelRuntime implements Models {
 		const configLoad = this.configLoadTail.then(() => ModelConfig.load(this.modelsPath));
 		// Keep the sequencing tail usable after a failed read; this invocation
 		// still observes its own failure through the original configLoad promise.
-		this.configLoadTail = configLoad.then(() => undefined, () => undefined);
+		this.configLoadTail = configLoad.then(
+			() => undefined,
+			() => undefined,
+		);
 		this.config = await configLoad;
 		this.configureRadiusProviders();
 		if (options.providers) {
@@ -943,7 +955,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(provider.id), undefined),
 			provider.auth.oauth && !provider.auth.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterRegistration();
 	}
 
 	/**
@@ -989,7 +1001,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(providerId), effective),
 			effective.oauth && !effective.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterRegistration();
 	}
 
 	unregisterProvider(providerId: string): void {
@@ -997,7 +1009,7 @@ export class ModelRuntime implements Models {
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterRegistration();
 	}
 
 	/**
@@ -1023,7 +1035,7 @@ export class ModelRuntime implements Models {
 			this.snapshot = { ...this.snapshot, auth, configuredProviders };
 		}
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterRegistration();
 	}
 
 	unregisterVirtualModel(providerId: string, id: string): void {
@@ -1032,7 +1044,7 @@ export class ModelRuntime implements Models {
 		if (models.size === 0) this.virtualModels.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterRegistration();
 	}
 
 	/**
