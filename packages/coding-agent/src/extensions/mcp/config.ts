@@ -29,7 +29,7 @@
  * with `codemode` exposure connects. A project value overrides the global one.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isMcpServerOverride, mcpNamespace } from "@earendil-works/pi-mcp";
 import { CONFIG_DIR_NAME } from "../../config.ts";
@@ -80,13 +80,36 @@ interface McpConfigState {
 	errors: string[];
 }
 
-function readConfigFile(path: string, scope: "global" | "project", state: McpConfigState): void {
+function readConfigText(path: string, maxConfigBytes?: number): string {
+	if (maxConfigBytes === undefined) return readFileSync(path, "utf8");
+	const file = openSync(path, "r");
+	try {
+		const bytes = Buffer.alloc(maxConfigBytes + 1);
+		let used = 0;
+		while (used < bytes.length) {
+			const count = readSync(file, bytes, used, bytes.length - used, null);
+			if (count === 0) break;
+			used += count;
+		}
+		if (used > maxConfigBytes) throw new Error("MCP configuration exceeds its size limit");
+		return bytes.toString("utf8", 0, used);
+	} finally {
+		closeSync(file);
+	}
+}
+
+function readConfigFile(
+	path: string,
+	scope: "global" | "project",
+	state: McpConfigState,
+	maxConfigBytes?: number,
+): void {
 	const { servers, errors } = state;
-	if (!existsSync(path)) return;
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(stripBom(readFileSync(path, "utf8")));
+		parsed = JSON.parse(stripBom(readConfigText(path, maxConfigBytes)));
 	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
 		return;
 	}
@@ -134,11 +157,16 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
  * Load global and (when trusted) project MCP configuration. Disabled servers are included with
  * `enabled: false`, so they can be enabled again.
  */
-export function loadMcpConfig(options: { agentDir: string; cwd: string; projectTrusted: boolean }): LoadedMcpConfig {
+export function loadMcpConfig(options: {
+	agentDir: string;
+	cwd: string;
+	projectTrusted: boolean;
+	maxConfigBytes?: number;
+}): LoadedMcpConfig {
 	const state: McpConfigState = { servers: new Map(), errors: [] };
-	readConfigFile(join(options.agentDir, "mcp.json"), "global", state);
+	readConfigFile(join(options.agentDir, "mcp.json"), "global", state, options.maxConfigBytes);
 	const projectConfig = options.projectTrusted ? join(options.cwd, CONFIG_DIR_NAME, "mcp.json") : undefined;
-	if (projectConfig) readConfigFile(projectConfig, "project", state);
+	if (projectConfig) readConfigFile(projectConfig, "project", state, options.maxConfigBytes);
 	return {
 		servers: [...state.servers.values()],
 		...(state.autoEnableCodemode === undefined ? {} : { autoEnableCodemode: state.autoEnableCodemode }),
