@@ -42,6 +42,7 @@ import {
 	McpServerLog,
 } from "../src/extensions/mcp/runtime.ts";
 import { convertMcpResult, createMcpResultSchema } from "../src/extensions/mcp/tools.ts";
+import { loadMcpConfig as loadPublicMcpConfig } from "../src/index.ts";
 
 // Config values are resolved at connect time, so the literal reference must survive loading.
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal config value reference
@@ -279,6 +280,22 @@ describe("MCP config", () => {
 			expect.stringContaining('server "cimdClient": oauth.clientRegistration "cimd" cannot be combined'),
 			expect.stringContaining('server "cimdPath": oauth.clientRegistration "cimd" requires oauth.callbackUrl'),
 		]);
+	});
+
+	it("bounds each configuration file through the public reader", () => {
+		const paths = setup(
+			{ mcpServers: { big: { command: "x".repeat(64) } } },
+			{ mcpServers: { small: { command: "y" } } },
+		);
+		const project = readFileSync(join(paths.cwd, ".pi", "mcp.json"));
+		const bounded = loadPublicMcpConfig({ ...paths, projectTrusted: true, maxConfigBytes: project.length });
+		expect(bounded.servers.map((server) => [server.name, server.scope])).toEqual([["small", "project"]]);
+		expect(bounded.errors).toEqual([expect.stringContaining("MCP configuration exceeds its size limit")]);
+		rmSync(join(paths.agentDir, "mcp.json"));
+		expect(loadPublicMcpConfig({ ...paths, projectTrusted: false, maxConfigBytes: 1 })).toEqual({
+			servers: [],
+			errors: [],
+		});
 	});
 
 	it("resolves per-tool exposure from exact names, then patterns in order", () => {
