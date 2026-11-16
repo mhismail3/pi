@@ -352,6 +352,11 @@ export interface ExtensionContext {
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/**
+	 * Directory whose `.pi` holds the project configuration. It equals `cwd` unless the host runs the
+	 * session in a subdirectory of the project (`projectDir` of `createAgentSession()`).
+	 */
+	projectDir: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
 	/** Model registry for API key resolution */

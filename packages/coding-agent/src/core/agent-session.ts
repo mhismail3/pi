@@ -141,11 +141,13 @@ import {
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
+	buildIdleSystemPrompt,
 	buildSystemPrompt,
 	buildSystemPromptSections,
 	diffSystemPromptSections,
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
+	type SkillsRenderer,
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
@@ -264,10 +266,14 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	preamble?: string;
+	renderSkills?: SkillsRenderer;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	/** Directory whose `.pi` holds project configuration. Default: `cwd`. */
+	projectDir?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for extensions, skills, prompts, themes, context files, and system prompt */
@@ -470,6 +476,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _projectDir: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	/**
@@ -511,11 +518,15 @@ export class AgentSession {
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
 
+	private readonly _preamble?: string;
+	private readonly _renderSkills?: SkillsRenderer;
 	private _baseSystemPromptOptions!: NormalizedBuildSystemPromptOptions;
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
 
 	constructor(config: AgentSessionConfig) {
+		this._preamble = config.preamble;
+		this._renderSkills = config.renderSkills;
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
@@ -523,6 +534,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._projectDir = config.projectDir ?? config.cwd;
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
@@ -966,26 +978,13 @@ export class AgentSession {
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
 			const nextContext = previousSnapshot?.context ?? context;
-			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
-			const options = normalizeBuildSystemPromptOptions({
-				...runOptions,
-				selectedTools: this.getActiveToolNames(),
-				toolSnippets: { ...this._baseSystemPromptOptions.toolSnippets, ...runOptions.toolSnippets },
-				toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
-			});
-			const updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
-			// Keep session.systemPrompt and ctx.getSystemPrompt() in step with what the provider sees.
-			this._runSystemPromptOptions = options;
-
+			this._applyToolLoadout(this.getActiveToolNames());
 			return {
 				...previousSnapshot,
 				context: {
 					...nextContext,
 					tools: this.agent.state.tools.slice(),
 				},
-				messages: updateMessage
-					? [...(previousSnapshot?.messages ?? []), updateMessage]
-					: previousSnapshot?.messages,
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
@@ -1550,9 +1549,17 @@ export class AgentSession {
 		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
-	/** Current effective system prompt, including changes not yet sent to the model. */
+	/**
+	 * Current effective system prompt, including changes not yet sent to the model: the run's
+	 * prompt during a run, and between runs the base prompt plus the extension sections the
+	 * transcript still gives the model (an MCP server listing, for example).
+	 */
 	get systemPrompt(): string {
-		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
+		if (this._runSystemPromptOptions) return buildSystemPrompt(this._runSystemPromptOptions);
+		return buildIdleSystemPrompt(
+			this._baseSystemPromptOptions,
+			getCurrentSystemMessage(this.agent.state.messages)?.sections ?? {},
+		);
 	}
 
 	/** Current retry attempt (0 if not retrying) */
@@ -1603,10 +1610,16 @@ export class AgentSession {
 	setActiveToolsByName(toolNames: string[]): void {
 		const previous = this.getActiveToolNames();
 		this._setActiveTools(toolNames);
-		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
-		// One that only adds tools, like activating tool_search, keeps them.
+		// A loadout that deactivates a tool replaces the restored one. Keep its explicitly
+		// requested pending names: MCP servers may still be connecting when a host reapplies it.
+		// One that only adds tools, like activating tool_search, keeps all pending names.
 		const active = new Set(this.getActiveToolNames());
-		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
+		if (previous.some((name) => !active.has(name))) {
+			const requested = new Set(toolNames);
+			for (const name of this._pendingToolNames) {
+				if (!requested.has(name)) this._pendingToolNames.delete(name);
+			}
+		}
 	}
 
 	private _setActiveTools(toolNames: string[]): void {
@@ -1803,6 +1816,8 @@ export class AgentSession {
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
+			preamble: this._preamble,
+			renderSkills: this._renderSkills,
 			cwd: this._cwd,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
@@ -1825,15 +1840,12 @@ export class AgentSession {
 	 * and persisted, and the forced text is projected onto the request by
 	 * {@link _installAgentForcedPromptProjection}.
 	 */
-	private _preparePromptAndToolLoadout(
-		options: NormalizedBuildSystemPromptOptions,
-		messages: AgentMessage[] = this.agent.state.messages,
-	): SystemMessage | undefined {
+	private _preparePromptAndToolLoadout(options: NormalizedBuildSystemPromptOptions): SystemMessage | undefined {
 		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
 		// The tool list and rules must match the declarations the request carries.
 		options.hiddenTools = [...this._hiddenDeclarations];
 		const sections = diffSystemPromptSections(
-			getCurrentSystemMessage(messages)?.sections ?? {},
+			getCurrentSystemMessage(this.agent.state.messages)?.sections ?? {},
 			buildSystemPromptSections(options),
 		);
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
@@ -1883,7 +1895,7 @@ export class AgentSession {
 			const current = getCurrentSystemMessage(transformed);
 			const head: SystemMessage = {
 				role: "system",
-				content: forced,
+				content: buildSystemPrompt(this._runSystemPromptOptions!),
 				...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
 				timestamp: current?.timestamp ?? Date.now(),
 			};
@@ -1946,8 +1958,13 @@ export class AgentSession {
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
+			// A host may revoke the prepared start by throwing from onStarted (RPC preflightResult),
+			// for example when it was stopped meanwhile. No run exists yet, so that ends the start
+			// like a failed preparation and the session is idle again.
+			onStarted?.();
 		} catch (error) {
 			this._isAgentRunActive = false;
+			this._runSystemPromptOptions = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			this._resolveIdleWaitIfIdle();
@@ -1957,7 +1974,6 @@ export class AgentSession {
 		// have while idle. No run exists yet, so they cannot split a tool call from its result.
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
-		onStarted?.();
 
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
@@ -2589,6 +2605,11 @@ export class AgentSession {
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
 		return this._followUpMessages;
+	}
+
+	/** Directory whose `.pi` holds the project configuration of this session. */
+	get projectDir(): string {
+		return this._projectDir;
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -3795,6 +3816,7 @@ export class AgentSession {
 			this._cwd,
 			this.sessionManager,
 			new ModelRegistry(this._modelRuntime),
+			this._projectDir,
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;

@@ -355,24 +355,30 @@ function loadSkillFromFile(
  * `fileReadTool` names the tool that loads skill files; `indirect` names none, for a reader that
  * is reachable only through another tool.
  */
-export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "bash" | "indirect" = "read"): string {
+export function formatSkillsForPrompt(
+	skills: Skill[],
+	fileReadTool: "read" | "bash" | "indirect" = "read",
+	instructions = true,
+): string {
 	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
 
 	if (visibleSkills.length === 0) {
 		return "";
 	}
 
-	const lines = [
-		"\n\nThe following skills provide specialized instructions for specific tasks.",
-		fileReadTool === "read"
-			? "Use the read tool to load a skill's file when the task matches its description."
-			: fileReadTool === "bash"
-				? "Use bash to load a skill's file when the task matches its description."
-				: "Load a skill's file when the task matches its description.",
-		"Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
-		"",
-		"<available_skills>",
-	];
+	const lines = instructions
+		? [
+				"\n\nThe following skills provide specialized instructions for specific tasks.",
+				fileReadTool === "read"
+					? "Use the read tool to load a skill's file when the task matches its description."
+					: fileReadTool === "bash"
+						? "Use bash to load a skill's file when the task matches its description."
+						: "Load a skill's file when the task matches its description.",
+				"Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
+				"",
+				"<available_skills>",
+			]
+		: ["<available_skills>"];
 
 	for (const skill of visibleSkills) {
 		lines.push("  <skill>");

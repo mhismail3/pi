@@ -29,7 +29,9 @@ The [complete minimal example](../examples/sdk/01-minimal.ts) also streams text 
 
 Read current state through `session.messages`, `session.model`, `session.thinkingLevel`, `session.systemPrompt`, and `session.getActiveToolNames()`.
 
-`session.systemPrompt` is read-only and returns the current effective system prompt, including changes that have not yet been sent to the model. Tool changes are declared to the model before the next request.
+`createAgentSession` and `createAgentSessionFromServices` accept a host-owned `preamble`. It replaces the default harness identity without suppressing tool snippets, tool-contributed guidelines or documentation. With a custom system prompt, the custom text becomes a separate `role` section after that preamble. Extensions can update the run's preamble through `before_agent_start` prompt options. A host `renderSkills(skills, fileReadTool, instructions)` option renders the `skills` and `project_skills` sections in place of Pi's skills block, for idle previews and requests alike. Tools activated during a run are declared to the model after the earlier tools; their prompt sections are applied when the next run starts.
+
+`session.systemPrompt` is read-only and returns the current effective system prompt, including changes that have not yet been sent to the model. Tool changes are declared to the model before the next request. During a run it is the run's prompt, forced text included. Between runs it is the base prompt plus the extension sections the transcript still gives the model, such as the `mcp_servers` listing; a `before_agent_start` handler that stops setting a section removes it at the next request.
 
 <a id="sessionmanager-api"></a>
 
@@ -52,6 +54,8 @@ const { session } = await createAgentSession({
 See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating, opening, continuing, listing, and forking sessions. [Session File Format](session-format.md) defines the persisted JSONL contract, and [Message Types](message-types.md) defines transcript values. For exact methods and signatures, use the exported TypeScript declarations or [`session-manager.ts`](../src/core/session-manager.ts).
 
 `cwd` selects the workspace used for project resource discovery, context files, session grouping, and built-in tool paths. Pass it explicitly when the target differs from `process.cwd()`.
+
+`projectDir` selects the directory whose `.pi` holds the project configuration when it is not `cwd`, for example the repository root of a session that runs in a subdirectory. Project settings, resources, packages, `SYSTEM.md`, and MCP servers then come from `<projectDir>/.pi`, and stdio MCP servers start in `projectDir`. Tools, context files, `.agents/skills` discovery, and session grouping still use `cwd`. Extensions read it as `ctx.projectDir`. `createAgentSessionServices()` passes it to the settings manager and resource loader it creates; when you construct them yourself, pass the same directory to `SettingsManager.create()`, `DefaultResourceLoader`, and `createAgentSession()`. Decide project trust for `projectDir`, since it gates that configuration; `hasTrustRequiringProjectResources(cwd, projectDir)` reports whether a decision is needed. `AgentSessionRuntime` calls its factory with the target `cwd` only, so a factory that uses `projectDir` resolves it for that `cwd`.
 
 `session.dispose()` aborts active work, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed.
 

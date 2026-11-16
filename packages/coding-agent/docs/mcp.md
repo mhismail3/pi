@@ -59,7 +59,7 @@ The format matches other MCP clients:
 }
 ```
 
-Stdio servers use `command`, `args`, `env`, and `cwd`. Relative `cwd` values resolve against the session directory. A leading `~/` in `command`, an argument, or `cwd` names the home directory.
+Stdio servers use `command`, `args`, `env`, and `cwd`. Servers start in the project directory, and relative `cwd` values resolve against it. The project directory is the working directory unless an SDK host sets [`projectDir`](sdk.md#session-management), which also selects the project `.pi/mcp.json` and is the root Pi reports to servers. A leading `~/` in `command`, an argument, or `cwd` names the home directory.
 
 HTTP servers use `url`, `headers`, and `oauth` (see [Authenticate with OAuth](#authenticate-with-oauth)). The legacy SSE transport is not supported.
 

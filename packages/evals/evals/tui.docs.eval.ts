@@ -131,6 +131,7 @@ async function inspectContextFooter(session: AgentSession, agentDir: string): Pr
 	const model = { ...activeModel, contextWindow: CONTEXT_WINDOW };
 	const services: AgentSessionServices = {
 		cwd: session.sessionManager.getCwd(),
+		projectDir: session.projectDir,
 		agentDir,
 		modelRuntime: session.modelRuntime,
 		settingsManager: session.settingsManager,

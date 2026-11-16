@@ -367,6 +367,7 @@ export class ExtensionRunner {
 	private uiContext: ExtensionUIContext;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
+	private projectDir: string;
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
@@ -405,11 +406,13 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
+		projectDir: string = cwd,
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
+		this.projectDir = projectDir;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
 	}
@@ -908,6 +911,10 @@ export class ExtensionRunner {
 			get cwd() {
 				runner.assertActive();
 				return runner.cwd;
+			},
+			get projectDir() {
+				runner.assertActive();
+				return runner.projectDir;
 			},
 			get sessionManager() {
 				runner.assertActive();
@@ -1436,7 +1443,7 @@ export class ExtensionRunner {
 		systemPromptOptions: BuildSystemPromptOptions,
 	): Promise<BeforeAgentStartCombinedResult> {
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
-		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
+		const renderCurrentSystemPrompt = (): string => buildSystemPrompt({ ...currentOptions, sections: {} });
 		const ctx = Object.defineProperties(
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),

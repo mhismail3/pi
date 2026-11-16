@@ -70,7 +70,7 @@ describe("extension active tools next-turn refresh", () => {
 		}
 	});
 
-	it("reports the refreshed system prompt during the run", async () => {
+	it("keeps the run's system prompt when tools change mid-run", async () => {
 		const harness = await createHarness({ extensionFactories: [registerSwitchTools] });
 		try {
 			harness.session.setActiveToolsByName(["switch_tools"]);
@@ -92,7 +92,7 @@ describe("extension active tools next-turn refresh", () => {
 			await harness.session.prompt("start");
 
 			expect(providerPrompts).toHaveLength(2);
-			expect(providerPrompts[0]).not.toBe(providerPrompts[1]);
+			expect(providerPrompts[1]).toBe(providerPrompts[0]);
 			expect(sessionPrompts).toEqual(providerPrompts);
 		} finally {
 			harness.cleanup();

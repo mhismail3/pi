@@ -534,7 +534,7 @@ Content`,
 			await loader.reload();
 
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([
-				{ path: join(agentDir, "AGENTS.override.md"), content: "global override" },
+				{ path: join(agentDir, "AGENTS.override.md"), content: "global override", global: true },
 				{ path: join(cwd, "AGENTS.md"), content: "project instructions" },
 				{ path: join(nestedCwd, "AGENTS.override.md"), content: "service override" },
 			]);
