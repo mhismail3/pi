@@ -36,12 +36,14 @@ export interface AgentSessionRuntimeDiagnostic {
  */
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
+	/** Directory whose `.pi` holds project configuration. Default: `cwd`. See `DefaultResourceLoaderOptions.projectDir`. */
+	projectDir?: string;
 	agentDir?: string;
 	settingsManager?: SettingsManager;
 	modelRuntime?: ModelRuntime;
 	modelRuntimeSignal?: AbortSignal;
 	extensionFlagValues?: Map<string, boolean | string>;
-	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
+	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "projectDir" | "agentDir" | "settingsManager">;
 	resourceLoaderReloadOptions?: ResourceLoaderReloadOptions;
 }
 
@@ -52,6 +54,7 @@ export interface CreateAgentSessionServicesOptions {
  * have been resolved against those services.
  */
 export interface CreateAgentSessionFromServicesOptions {
+	preamble?: string;
 	services: AgentSessionServices;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
@@ -72,6 +75,7 @@ export interface CreateAgentSessionFromServicesOptions {
  */
 export interface AgentSessionServices {
 	cwd: string;
+	projectDir: string;
 	agentDir: string;
 	modelRuntime: ModelRuntime;
 	settingsManager: SettingsManager;
@@ -136,6 +140,7 @@ export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
 	const cwd = resolvePath(options.cwd);
+	const projectDir = options.projectDir ? resolvePath(options.projectDir) : cwd;
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
 	const modelRuntime =
 		options.modelRuntime ??
@@ -144,10 +149,11 @@ export async function createAgentSessionServices(
 			modelsPath: join(agentDir, "models.json"),
 			signal: options.modelRuntimeSignal,
 		}));
-	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const settingsManager = options.settingsManager ?? SettingsManager.create(projectDir, agentDir);
 	const resourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		cwd,
+		projectDir,
 		agentDir,
 		settingsManager,
 	});
@@ -196,6 +202,7 @@ export async function createAgentSessionServices(
 
 	return {
 		cwd,
+		projectDir,
 		agentDir,
 		modelRuntime,
 		settingsManager,
@@ -215,7 +222,9 @@ export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
 	return createAgentSession({
+		preamble: options.preamble,
 		cwd: options.services.cwd,
+		projectDir: options.services.projectDir,
 		agentDir: options.services.agentDir,
 		modelRuntime: options.services.modelRuntime,
 		settingsManager: options.services.settingsManager,

@@ -74,6 +74,42 @@ describe("buildSystemPrompt", () => {
 			);
 			expect(prompt).toContain("<cwd>\n/tmp\n</cwd>");
 		});
+
+		test("renders global rules and skills before every project and cwd section", () => {
+			const projectSkill: Skill = {
+				...testSkill,
+				name: "project-skill",
+				filePath: "/repo/.pi/skills/project-skill/SKILL.md",
+				sourceInfo: createSyntheticSourceInfo("/repo/.pi/skills/project-skill/SKILL.md", { source: "local", scope: "project" }),
+			};
+			const build = (project: string) =>
+				buildSystemPrompt({
+					preamble: "Host.",
+					appendSystemPrompt: "Additional instructions.",
+					contextFiles: [
+						{ path: "/agent/AGENTS.md", content: "Global rules.", global: true },
+						{ path: `/${project}/AGENTS.md`, content: `${project} rules.` },
+					],
+					selectedTools: ["read"],
+					skills: [{ ...projectSkill, filePath: `/${project}/.pi/skills/project-skill/SKILL.md` }, testSkill],
+					sections: { tron: `${project} facts` },
+					cwd: `/${project}`,
+				});
+			const first = build("alpha");
+			const second = build("beta");
+			const boundary = first.indexOf("\n\n<project_context>");
+			expect(boundary).toBeGreaterThan(0);
+			expect(second.slice(0, boundary)).toBe(first.slice(0, boundary));
+			expect(first.slice(0, boundary)).toContain(
+				'<global_context>\n<project_instructions path="/agent/AGENTS.md">\nGlobal rules.\n</project_instructions>\n</global_context>',
+			);
+			expect(first.slice(0, boundary)).toContain("<name>test-skill</name>");
+			expect(first.slice(0, boundary)).not.toContain("alpha");
+			const order = ["<addendum>", "<global_context>", "<skills>", "<project_context>", "<project_skills>", "<cwd>", "<tron>"];
+			expect(order.map((tag) => first.indexOf(tag))).toEqual(order.map((tag) => first.indexOf(tag)).toSorted((a, b) => a - b));
+			expect(first).toContain("<project_skills>\n<available_skills>\n  <skill>\n    <name>project-skill</name>");
+			expect(first.match(/The following skills provide specialized instructions/g)).toHaveLength(1);
+		});
 	});
 
 	describe("default tools", () => {

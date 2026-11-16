@@ -25,8 +25,8 @@ import type { ExtensionFactory } from "../src/index.ts";
 import { createHarness } from "./suite/harness.ts";
 
 describe("system prompt updates", () => {
-	test("declares the prompt and tools once and reuses them across resume", async () => {
-		const harness = await createHarness();
+	test("declares the host preamble and tool guidelines once and reuses them across resume", async () => {
+		const harness = await createHarness({ preamble: "Host identity." });
 		try {
 			harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
 			await harness.session.prompt("one");
@@ -45,6 +45,9 @@ describe("system prompt updates", () => {
 			const head = harness.session.messages[0];
 			if (head?.role !== "system") throw new Error("expected system message");
 			expect(head.content).toBe("");
+			expect(head.sections?.preamble).toBe("Host identity.");
+			expect(head.sections?.rules).toContain("Use read");
+			expect(head.sections?.docs).toContain("Pi documentation");
 			expect(Object.keys(head.sections ?? {})).toEqual(["preamble", "tools", "rules", "docs", "cwd"]);
 			expect(head.toolsAdded?.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
 			expect(getSystemMessageText(head)).toBe(harness.session.systemPrompt);
@@ -112,6 +115,10 @@ describe("system prompt updates", () => {
 		const previous = buildSystemPromptSections({ customPrompt: "You are A.", cwd: "/tmp" });
 		const current = buildSystemPromptSections({ customPrompt: "You are B.", cwd: "/tmp" });
 		expect(previous.preamble).toBe("You are A.");
+		const hosted = buildSystemPromptSections({ preamble: "Host identity.", customPrompt: "Role instructions.", cwd: "/tmp" });
+		expect(hosted.preamble).toBe("Host identity.");
+		expect(hosted.role).toBe("<role>\nRole instructions.\n</role>");
+		expect(hosted.rules).toContain("Be concise");
 		expect(diffSystemPromptSections(previous, current)).toEqual({ preamble: "You are B." });
 
 		expect(buildSystemPromptState({ forceSystemPrompt: "Exact prompt.", cwd: "/tmp" })).toEqual({
@@ -158,8 +165,11 @@ describe("system prompt updates", () => {
 				toolsAdded: systemMessages[0]?.[0]?.toolsAdded,
 				timestamp: systemMessages[0]?.[0]?.timestamp,
 			});
-			expect(systemMessages[2]?.at(-1)).toEqual(forced);
-			expect(getCurrentSystemPrompt(requests[2]!.messages)).toBe("Exact prompt.");
+			expect(systemMessages[2]?.at(-1)).toEqual({
+				...forced,
+				content: "Exact prompt.\n\n<plan_mode>\nPlan only.\n</plan_mode>",
+			});
+			expect(getCurrentSystemPrompt(requests[2]!.messages)).toBe("Exact prompt.\n\n<plan_mode>\nPlan only.\n</plan_mode>");
 			expect(requests[2]!.messages.map((message) => message.role)).toEqual([
 				"system",
 				"user",
@@ -179,6 +189,57 @@ describe("system prompt updates", () => {
 				{ plan_mode: null },
 			]);
 			expect(getCurrentSystemPrompt(harness.session.messages)).toBe(harness.session.systemPrompt);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	test("between runs keeps the extension sections the model has and never promotes a one-run section", async () => {
+		let turn = 0;
+		const extension: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "extra",
+				label: "extra",
+				description: "extra description",
+				promptSnippet: "extra prompt snippet",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [], details: {} }),
+			});
+			pi.on("before_agent_start", (event) => {
+				// Set for every run, as the MCP server listing is; `once` only for the first run.
+				event.systemPromptOptions.sections.servers = "Every run.";
+				if (++turn === 1) event.systemPromptOptions.sections.once = "First run only.";
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extension], initialActiveToolNames: ["read"] });
+		try {
+			const received: string[] = [];
+			harness.setResponses(
+				["one", "two"].map((text) => (providerContext: TranscriptContext) => {
+					received.push(getCurrentSystemPrompt(providerContext.messages));
+					return fauxAssistantMessage(text);
+				}),
+			);
+			// Sections are set at prompt admission, not anticipated before it.
+			expect(harness.session.systemPrompt).not.toContain("<servers>");
+			await harness.session.prompt("one");
+			expect(received[0]).toContain("<servers>\nEvery run.\n</servers>");
+			expect(received[0]).toContain("<once>\nFirst run only.\n</once>");
+			expect(harness.session.systemPrompt).toBe(received[0]);
+			expect(harness.session.systemPrompt).toBe(getCurrentSystemPrompt(harness.session.messages));
+
+			// An accepted tool change not yet sent shows beside the sections the model has.
+			harness.session.setActiveToolsByName(["read", "extra"]);
+			const pending = harness.session.systemPrompt;
+			expect(pending).toContain("- extra: extra prompt snippet");
+			expect(pending).toContain("<servers>\nEvery run.\n</servers>");
+
+			await harness.session.prompt("two");
+			expect(received[1]).toContain("- extra: extra prompt snippet");
+			expect(received[1]).toContain("<servers>\nEvery run.\n</servers>");
+			expect(received[1]).not.toContain("<once>");
+			expect(harness.session.systemPrompt).toBe(received[1]);
+			expect(harness.session.systemPrompt).toBe(getCurrentSystemPrompt(harness.session.messages));
 		} finally {
 			harness.cleanup();
 		}

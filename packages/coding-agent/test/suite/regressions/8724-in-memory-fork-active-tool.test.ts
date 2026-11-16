@@ -42,6 +42,7 @@ describe("regression #8724: in-memory fork during an active tool turn", () => {
 		const harness = await createHarness({ tools: [blockingTool] });
 		const services: AgentSessionServices = {
 			cwd: harness.tempDir,
+			projectDir: harness.tempDir,
 			agentDir: harness.tempDir,
 			modelRuntime: harness.session.modelRuntime,
 			settingsManager: harness.settingsManager,
