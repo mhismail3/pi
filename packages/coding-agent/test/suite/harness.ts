@@ -109,6 +109,7 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
 }
 
 export interface HarnessOptions {
+	preamble?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
@@ -232,6 +233,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
 	const session = new AgentSession({
+		preamble: options.preamble,
 		agent,
 		sessionManager,
 		settingsManager,

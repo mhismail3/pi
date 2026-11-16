@@ -156,7 +156,10 @@ export interface PackageManager {
 }
 
 interface PackageManagerOptions {
+	/** Working directory. Project `.agents/skills` are discovered from it and its parents. */
 	cwd: string;
+	/** Directory whose `.pi` holds project settings and packages. Default: `cwd`. */
+	projectDir?: string;
 	agentDir: string;
 	settingsManager: SettingsManager;
 	/** Names of built-in extensions, resolved as `builtin:<name>` extension resources. */
@@ -881,6 +884,7 @@ function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], b
 
 export class DefaultPackageManager implements PackageManager {
 	private cwd: string;
+	private projectDir: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
 	private builtinExtensions: string[];
@@ -890,6 +894,7 @@ export class DefaultPackageManager implements PackageManager {
 
 	constructor(options: PackageManagerOptions) {
 		this.cwd = resolvePath(options.cwd);
+		this.projectDir = options.projectDir ? resolvePath(options.projectDir) : this.cwd;
 		this.agentDir = resolvePath(options.agentDir);
 		this.settingsManager = options.settingsManager;
 		this.builtinExtensions = options.builtinExtensions ?? [];
@@ -1006,7 +1011,7 @@ export class DefaultPackageManager implements PackageManager {
 		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
 
 		const globalBaseDir = this.agentDir;
-		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
+		const projectBaseDir = join(this.projectDir, CONFIG_DIR_NAME);
 
 		for (const resourceType of RESOURCE_TYPES) {
 			const target = this.getTargetMap(accumulator, resourceType);
@@ -1720,7 +1725,7 @@ export class DefaultPackageManager implements PackageManager {
 		const stdout = await this.runCommandCapture(
 			npmCommand.command,
 			[...npmCommand.args, "view", packageSpec, "version", "--json"],
-			{ cwd: this.cwd, timeoutMs: NETWORK_TIMEOUT_MS },
+			{ cwd: this.projectDir, timeoutMs: NETWORK_TIMEOUT_MS },
 		);
 		const raw = stdout.trim();
 		if (!raw) throw new Error("Empty response from npm view");
@@ -2288,7 +2293,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		if (scope === "project") {
 			this.assertProjectTrustedForScope(scope);
-			return join(this.cwd, CONFIG_DIR_NAME, "npm");
+			return join(this.projectDir, CONFIG_DIR_NAME, "npm");
 		}
 		return join(this.agentDir, "npm");
 	}
@@ -2329,7 +2334,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		if (scope === "project") {
 			this.assertProjectTrustedForScope(scope);
-			return join(this.cwd, CONFIG_DIR_NAME, "npm", "node_modules", source.name);
+			return join(this.projectDir, CONFIG_DIR_NAME, "npm", "node_modules", source.name);
 		}
 		return join(this.agentDir, "npm", "node_modules", source.name);
 	}
@@ -2369,7 +2374,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		if (scope === "project") {
 			this.assertProjectTrustedForScope(scope);
-			return join(this.cwd, CONFIG_DIR_NAME, "git");
+			return join(this.projectDir, CONFIG_DIR_NAME, "git");
 		}
 		return join(this.agentDir, "git");
 	}
@@ -2395,7 +2400,7 @@ export class DefaultPackageManager implements PackageManager {
 	private getBaseDirForScope(scope: SourceScope): string {
 		if (scope === "project") {
 			this.assertProjectTrustedForScope(scope);
-			return join(this.cwd, CONFIG_DIR_NAME);
+			return join(this.projectDir, CONFIG_DIR_NAME);
 		}
 		if (scope === "user") {
 			return this.agentDir;

@@ -7,6 +7,7 @@ import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
 export interface BuildSystemPromptOptions {
+	preamble?: string;
 	/** Custom system prompt (replaces the default prefix). */
 	customPrompt?: string;
 	/** Exact full prompt replacement set by a before_agent_start handler. */
@@ -59,6 +60,7 @@ const SYSTEM_PROMPT_SECTION_NAME = /^[a-z][a-z0-9_-]*$/;
 /** Normalize prompt input into the mutable, collection-complete shape exposed to extensions. */
 export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOptions): NormalizedBuildSystemPromptOptions {
 	return {
+		preamble: input.preamble,
 		customPrompt: input.customPrompt,
 		forceSystemPrompt: input.forceSystemPrompt,
 		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])],
@@ -128,6 +130,7 @@ function buildRules(
 export function buildSystemPromptSections(input: BuildSystemPromptOptions): SystemPromptSections {
 	const options = normalizeBuildSystemPromptOptions(input);
 	const {
+		preamble,
 		customPrompt,
 		selectedTools,
 		hiddenTools,
@@ -149,11 +152,10 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 
 	const declaredTools = selectedTools.filter((name) => !hiddenTools.includes(name));
 	const promptSections: Record<string, string> = {};
-	if (customPrompt) {
-		promptSections.preamble = customPrompt;
-	} else {
-		promptSections.preamble =
-			"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+	promptSections.preamble = preamble ?? customPrompt ??
+		"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+	if (preamble !== undefined && customPrompt) promptSections.role = customPrompt;
+	if (preamble !== undefined || !customPrompt) {
 		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
@@ -199,13 +201,40 @@ export function buildSystemPromptState(input: BuildSystemPromptOptions): {
 	content: string;
 	sections?: SystemPromptSections;
 } {
-	if (input.forceSystemPrompt !== undefined) return { content: input.forceSystemPrompt };
+	if (input.forceSystemPrompt !== undefined) {
+		const rendered = buildSystemPromptSections(input);
+		const sections = Object.fromEntries(
+			Object.keys(input.sections ?? {}).filter((name) => rendered[name] !== undefined).map((name) => [name, rendered[name]]),
+		);
+		return { content: input.forceSystemPrompt, ...(Object.keys(sections).length > 0 ? { sections } : {}) };
+	}
 	return { content: "", sections: buildSystemPromptSections(input) };
 }
 
 /** Build the system prompt text, rendered exactly as the transcript's system message replays it. */
 export function buildSystemPrompt(input: BuildSystemPromptOptions): string {
 	return getSystemMessageText({ role: "system", ...buildSystemPromptState(input), timestamp: 0 });
+}
+
+/** Sections Pi renders from its own options; every other section was set through `sections`. */
+const BUILT_IN_SECTIONS = new Set(["preamble", "tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"]);
+
+/**
+ * The system prompt between runs. `before_agent_start` handlers set `sections` for each run, and
+ * the transcript keeps a section until a later run no longer sets it, so the model still has the
+ * sections in `current` (replayed from the transcript) that Pi does not render itself. `options`
+ * supplies Pi's own sections, including changes not yet sent to the model. Nothing here is written
+ * back into prompt options: a section set for one run is never promoted into a later run.
+ */
+export function buildIdleSystemPrompt(
+	options: BuildSystemPromptOptions,
+	current: Record<string, string | null>,
+): string {
+	const sections = buildSystemPromptSections(options);
+	for (const [name, text] of Object.entries(current)) {
+		if (text !== null && !BUILT_IN_SECTIONS.has(name) && sections[name] === undefined) sections[name] = text;
+	}
+	return getSystemMessageText({ role: "system", content: "", sections, timestamp: 0 });
 }
 
 /**
