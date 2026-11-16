@@ -6,7 +6,11 @@ import { getSystemMessageText } from "@earendil-works/pi-ai";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
+export type SkillsRenderer = (skills: Skill[], fileReadTool: "read" | "bash" | "indirect", instructions: boolean) => string;
+
 export interface BuildSystemPromptOptions {
+	preamble?: string;
+	renderSkills?: SkillsRenderer;
 	/** Custom system prompt (replaces the default prefix). */
 	customPrompt?: string;
 	/** Exact full prompt replacement set by a before_agent_start handler. */
@@ -30,8 +34,8 @@ export interface BuildSystemPromptOptions {
 	sections?: Record<string, string>;
 	/** Working directory. */
 	cwd: string;
-	/** Pre-loaded context files. */
-	contextFiles?: Array<{ path: string; content: string }>;
+	/** Pre-loaded context files; `global` marks the agent directory's file, rendered before project files. */
+	contextFiles?: Array<{ path: string; content: string; global?: boolean }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
 }
@@ -44,7 +48,7 @@ export type NormalizedBuildSystemPromptOptions = BuildSystemPromptOptions & {
 	promptGuidelines: string[];
 	appendSystemPrompt: string;
 	sections: Record<string, string>;
-	contextFiles: Array<{ path: string; content: string }>;
+	contextFiles: Array<{ path: string; content: string; global?: boolean }>;
 	skills: Skill[];
 };
 
@@ -59,6 +63,8 @@ const SYSTEM_PROMPT_SECTION_NAME = /^[a-z][a-z0-9_-]*$/;
 /** Normalize prompt input into the mutable, collection-complete shape exposed to extensions. */
 export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOptions): NormalizedBuildSystemPromptOptions {
 	return {
+		preamble: input.preamble,
+		renderSkills: input.renderSkills,
 		customPrompt: input.customPrompt,
 		forceSystemPrompt: input.forceSystemPrompt,
 		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])],
@@ -76,13 +82,10 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 	};
 }
 
-function renderProjectContext(contextFiles: Array<{ path: string; content: string }>): string {
-	return [
-		"Project-specific instructions and guidelines:",
-		...contextFiles.map(
-			({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`,
-		),
-	].join("\n\n");
+function renderContextFiles(contextFiles: Array<{ path: string; content: string }>): string {
+	return contextFiles
+		.map(({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`)
+		.join("\n\n");
 }
 
 function buildRules(
@@ -128,6 +131,8 @@ function buildRules(
 export function buildSystemPromptSections(input: BuildSystemPromptOptions): SystemPromptSections {
 	const options = normalizeBuildSystemPromptOptions(input);
 	const {
+		preamble,
+		renderSkills = formatSkillsForPrompt,
 		customPrompt,
 		selectedTools,
 		hiddenTools,
@@ -149,11 +154,10 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 
 	const declaredTools = selectedTools.filter((name) => !hiddenTools.includes(name));
 	const promptSections: Record<string, string> = {};
-	if (customPrompt) {
-		promptSections.preamble = customPrompt;
-	} else {
-		promptSections.preamble =
-			"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+	promptSections.preamble = preamble ?? customPrompt ??
+		"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+	if (preamble !== undefined && customPrompt) promptSections.role = customPrompt;
+	if (preamble !== undefined || !customPrompt) {
 		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
@@ -169,15 +173,25 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 	}
 
 	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
-	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
+	const globalFiles = contextFiles.filter((file) => file.global);
+	const projectFiles = contextFiles.filter((file) => !file.global);
+	if (globalFiles.length > 0) promptSections.global_context = renderContextFiles(globalFiles);
 	// A hidden reader is still reachable through another tool, so skills stay but the hint names no tool.
 	const readers = ["read", "bash"] as const;
 	const skillFileReadTool =
 		readers.find((tool) => declaredTools.includes(tool)) ??
 		(readers.some((tool) => selectedTools.includes(tool)) ? "indirect" : undefined);
-	if (skillFileReadTool && skills.length > 0) {
-		const skillsPrompt = formatSkillsForPrompt(skills, skillFileReadTool).trim();
+	const projectSkills = skills.filter((skill) => skill.sourceInfo.scope === "project");
+	if (skillFileReadTool) {
+		const skillsPrompt = renderSkills(skills.filter((skill) => skill.sourceInfo.scope !== "project"), skillFileReadTool, true).trim();
 		if (skillsPrompt) promptSections.skills = skillsPrompt;
+	}
+	if (projectFiles.length > 0) {
+		promptSections.project_context = ["Project-specific instructions and guidelines:", renderContextFiles(projectFiles)].join("\n\n");
+	}
+	if (skillFileReadTool) {
+		const projectSkillsPrompt = renderSkills(projectSkills, skillFileReadTool, !promptSections.skills).trim();
+		if (projectSkillsPrompt) promptSections.project_skills = projectSkillsPrompt;
 	}
 	promptSections.cwd = cwd.replace(/\\/g, "/");
 	for (const [name, content] of Object.entries(customSections)) {
@@ -199,13 +213,40 @@ export function buildSystemPromptState(input: BuildSystemPromptOptions): {
 	content: string;
 	sections?: SystemPromptSections;
 } {
-	if (input.forceSystemPrompt !== undefined) return { content: input.forceSystemPrompt };
+	if (input.forceSystemPrompt !== undefined) {
+		const rendered = buildSystemPromptSections(input);
+		const sections = Object.fromEntries(
+			Object.keys(input.sections ?? {}).filter((name) => rendered[name] !== undefined).map((name) => [name, rendered[name]]),
+		);
+		return { content: input.forceSystemPrompt, ...(Object.keys(sections).length > 0 ? { sections } : {}) };
+	}
 	return { content: "", sections: buildSystemPromptSections(input) };
 }
 
 /** Build the system prompt text, rendered exactly as the transcript's system message replays it. */
 export function buildSystemPrompt(input: BuildSystemPromptOptions): string {
 	return getSystemMessageText({ role: "system", ...buildSystemPromptState(input), timestamp: 0 });
+}
+
+/** Sections Pi renders from its own options; every other section was set through `sections`. */
+const BUILT_IN_SECTIONS = new Set(["preamble", "role", "tools", "rules", "docs", "addendum", "global_context", "skills", "project_context", "project_skills", "cwd"]);
+
+/**
+ * The system prompt between runs. `before_agent_start` handlers set `sections` for each run, and
+ * the transcript keeps a section until a later run no longer sets it, so the model still has the
+ * sections in `current` (replayed from the transcript) that Pi does not render itself. `options`
+ * supplies Pi's own sections, including changes not yet sent to the model. Nothing here is written
+ * back into prompt options: a section set for one run is never promoted into a later run.
+ */
+export function buildIdleSystemPrompt(
+	options: BuildSystemPromptOptions,
+	current: Record<string, string | null>,
+): string {
+	const sections = buildSystemPromptSections(options);
+	for (const [name, text] of Object.entries(current)) {
+		if (text !== null && !BUILT_IN_SECTIONS.has(name) && sections[name] === undefined) sections[name] = text;
+	}
+	return getSystemMessageText({ role: "system", content: "", sections, timestamp: 0 });
 }
 
 /**

@@ -184,6 +184,9 @@ export class ModelRuntime implements Models {
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
 	private config: ModelConfig;
+	// A later readiness pass must not overtake an older config read and leave
+	// that detached registration refresh able to start storage work afterwards.
+	private configLoadTail: Promise<void> = Promise.resolve();
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
 		available: [],
@@ -883,7 +886,11 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
-		this.config = await ModelConfig.load(this.modelsPath);
+		const configLoad = this.configLoadTail.then(() => ModelConfig.load(this.modelsPath));
+		// Keep the sequencing tail usable after a failed read; this invocation
+		// still observes its own failure through the original configLoad promise.
+		this.configLoadTail = configLoad.then(() => undefined, () => undefined);
+		this.config = await configLoad;
 		this.configureRadiusProviders();
 		if (options.providers) {
 			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);
